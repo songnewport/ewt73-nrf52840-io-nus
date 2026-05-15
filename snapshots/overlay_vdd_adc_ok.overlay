@@ -1,0 +1,53 @@
+/*
+ * EWT73-TBCE / E73-2G4M08S1C BLE baseline overlay.
+ *
+ * LEDs:
+ *   P0.12, P0.04, P1.09, active low
+ * ADC channel 0 samples internal VDD using Zephyr's nRF SAADC driver.
+ */
+
+/ {
+	zephyr,user {
+		io-channels = <&adc 0>;
+	};
+
+	aliases {
+		led0 = &ewt_led0;
+		led1 = &ewt_led1;
+		led2 = &ewt_led2;
+	};
+
+	ewt_leds {
+		compatible = "gpio-leds";
+
+		ewt_led0: led_0 {
+			gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+			label = "EWT73 LED P0.12";
+		};
+
+		ewt_led1: led_1 {
+			gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+			label = "EWT73 LED P0.04";
+		};
+
+		ewt_led2: led_2 {
+			gpios = <&gpio1 9 GPIO_ACTIVE_LOW>;
+			label = "EWT73 LED P1.09";
+		};
+	};
+};
+
+&adc {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_VDD>;
+		zephyr,resolution = <14>;
+		zephyr,oversampling = <8>;
+	};
+};
