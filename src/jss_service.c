@@ -195,7 +195,7 @@ int jss_service_notify_live_data(struct bt_conn *conn)
 	params.func = live_notify_complete;
 
 	live_notify_attempts++;
-	err = bt_gatt_notify_cb(NULL, &params);
+	err = bt_gatt_notify_cb(conn, &params);
 	live_notify_last_err = err;
 	return err;
 }

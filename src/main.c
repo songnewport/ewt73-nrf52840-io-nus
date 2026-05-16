@@ -533,36 +533,24 @@ static bool any_live_subscribed_conn(void)
 	return first_live_subscribed_conn() != NULL;
 }
 
-struct bond_match_context {
-	const bt_addr_le_t *addr;
-	bool found;
-};
-
-static void match_bond(const struct bt_bond_info *info, void *user_data)
-{
-	struct bond_match_context *ctx = user_data;
-
-	if (bt_addr_le_cmp(&info->addr, ctx->addr) == 0) {
-		ctx->found = true;
-	}
-}
-
 static bool peer_is_bonded(struct bt_conn *conn)
 {
-	struct bt_conn_info info;
-	struct bond_match_context ctx = {
-		.found = false,
-	};
-	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
-
-	if (bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE && info.le.dst) {
-		addr = info.le.dst;
+	/*
+	 * Keep this close to Zephyr's security model: the LED characteristic has
+	 * BT_GATT_PERM_WRITE_ENCRYPT, so the stack enforces encryption before the
+	 * write handler runs. Do not compare the active peer address with the bond
+	 * address here; Android may connect with a resolvable/private address while
+	 * Zephyr stores the identity address in the bond table.
+	 */
+	if (!conn) {
+		return false;
 	}
 
-	ctx.addr = addr;
+	if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
+		return false;
+	}
 
-	bt_foreach_bond(BT_ID_DEFAULT, match_bond, &ctx);
-	return ctx.found;
+	return refresh_bonded_count() > 0;
 }
 
 static void remove_conn(struct bt_conn *conn)

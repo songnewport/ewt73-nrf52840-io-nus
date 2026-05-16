@@ -299,7 +299,6 @@ class MainActivity : Activity(), JustinBleCallbacks {
                     setOnClickListener {
                         stopScan()
                         selectedDevice = device
-                        rememberDevice(device)
                         connectDevice(device)
                     }
                 })
@@ -341,7 +340,6 @@ class MainActivity : Activity(), JustinBleCallbacks {
             override fun onDeviceReady(device: BluetoothDevice) {
                 if (connectSession == thisConnectSession) {
                     setState(AppState.CONNECTED)
-                    rememberDevice(device)
                     connectionView.text = "Connected ${device.address}"
                     addLog("Device ready")
                     manager.readLiveData()
@@ -384,6 +382,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
     }
 
     override fun onLedWriteDone(on: Boolean) {
+        selectedDevice?.let { rememberDevice(it) }
         ledOn = on
         renderLedButton()
         addLog("LED write OK: ${if (on) "01" else "00"}")
