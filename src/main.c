@@ -93,11 +93,10 @@ K_SEM_DEFINE(start_ble_sem, 0, 1);
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, JSS_SERVICE_UUID_VAL),
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
 static void pair_mode_timeout_handler(struct k_work *work);
@@ -513,10 +512,17 @@ static void match_bond(const struct bt_bond_info *info, void *user_data)
 
 static bool peer_is_bonded(struct bt_conn *conn)
 {
+	struct bt_conn_info info;
 	struct bond_match_context ctx = {
-		.addr = bt_conn_get_dst(conn),
 		.found = false,
 	};
+	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+
+	if (bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE && info.le.dst) {
+		addr = info.le.dst;
+	}
+
+	ctx.addr = addr;
 
 	bt_foreach_bond(BT_ID_DEFAULT, match_bond, &ctx);
 	return ctx.found;
@@ -629,13 +635,11 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	led_set(&conn_led, 1);
 	LOG_INF("Connected: %s", addr);
 
-	if (peer_is_bonded(conn) || atomic_get(&pair_mode_active)) {
-		sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
-		if (sec_err) {
-			LOG_WRN("Security request failed: %d", sec_err);
-		} else {
-			LOG_INF("Security requested");
-		}
+	sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
+	if (sec_err) {
+		LOG_WRN("Security request failed: %d", sec_err);
+	} else {
+		LOG_INF("Security requested");
 	}
 }
 
@@ -665,7 +669,11 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
 	ARG_UNUSED(conn);
 
 	if (bonded) {
-		refresh_bonded_count();
+		uint32_t count = refresh_bonded_count();
+
+		if (count == 0) {
+			atomic_set(&bonded_count, 1);
+		}
 		bt_set_bondable(false);
 		atomic_set(&pair_mode_active, 0);
 		(void)k_work_cancel_delayable(&pair_mode_timeout_work);
