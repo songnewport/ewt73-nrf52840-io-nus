@@ -69,6 +69,8 @@ class MainActivity : Activity() {
     private var statusCharacteristic: BluetoothGattCharacteristic? = null
     private var ledCharacteristic: BluetoothGattCharacteristic? = null
     private var ledOn = false
+    private var isScanning = false
+    private var scanSession = 0
     private var descriptorWriteInProgress = false
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
@@ -111,7 +113,13 @@ class MainActivity : Activity() {
         }
 
         override fun onScanFailed(errorCode: Int) {
-            showError("Scan failed: $errorCode")
+            isScanning = false
+            if (errorCode == ScanCallback.SCAN_FAILED_ALREADY_STARTED) {
+                addLog("Scan already started")
+                setState(AppState.SCANNING)
+            } else {
+                showError("Scan failed: $errorCode")
+            }
         }
     }
 
@@ -453,15 +461,18 @@ class MainActivity : Activity() {
         }
 
         closeGatt()
+        stopScan()
+        val thisScanSession = ++scanSession
         foundDevices.clear()
         devicesView.removeAllViews()
         setState(AppState.SCANNING)
         connectionView.text = "Scanning for Justin_Shunt_Test..."
         addLog("Scan started")
+        isScanning = true
         bluetoothAdapter.bluetoothLeScanner.startScan(scanCallback)
 
         mainHandler.postDelayed({
-            if (state == AppState.SCANNING && foundDevices.isEmpty()) {
+            if (scanSession == thisScanSession && state == AppState.SCANNING && foundDevices.isEmpty()) {
                 stopScan()
                 connectionView.text = "No device found. Hold PAIR 5s and scan again."
                 setState(AppState.WAIT_PAIR_BUTTON)
@@ -680,9 +691,10 @@ class MainActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     private fun stopScan() {
-        if (hasPermissions()) {
+        if (hasPermissions() && isScanning) {
             bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         }
+        isScanning = false
     }
 
     private fun closeGatt() {
