@@ -4,7 +4,7 @@ Bring-up firmware for the EBYTE E73 / EWT73 nRF52840 test board.
 
 BLE device name: `E73_IO_NUS`
 
-This project advertises Nordic UART Service and sends test data once per second
+This project advertises Nordic UART Service and sends test data every 3 seconds
 after a phone or PC connects and subscribes to NUS TX.
 
 Known-good result on 2026-05-15:
@@ -56,6 +56,14 @@ Button counters:
 
 - `pair=a/b` means `a` short presses and `b` 5-second pair-mode requests
 - `clear=c` means `c` 10-second clear-bonds requests
+
+Button events are also sent immediately:
+
+```text
+BUTTON,PAIR_SHORT,count=1
+BUTTON,ENTER_PAIR_MODE,count=1
+BUTTON,CLEAR_BONDS_REQUESTED,count=1
+```
 
 Temperature fields use x10 Celsius:
 

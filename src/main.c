@@ -28,6 +28,7 @@
 
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
+#define STATUS_REPORT_INTERVAL_SECONDS 3
 
 #define ADC_AIN1_CHANNEL 0
 #define ADC_AIN4_CHANNEL 1
@@ -102,6 +103,16 @@ static void activity_pulse(void)
 {
 	led_set(&activity_led, 1);
 	(void)k_work_reschedule(&activity_led_off_work, K_MSEC(80));
+}
+
+static void nus_send_text(const char *text)
+{
+	if (!atomic_get(&ble_connected) || !current_conn) {
+		return;
+	}
+
+	(void)bt_nus_send(current_conn, text, strlen(text));
+	activity_pulse();
 }
 
 static void error_blink_forever(uint8_t code)
@@ -473,20 +484,28 @@ static struct bt_nus_cb nus_cb = {
 
 static void button_event_handler(enum button_control_event event, void *user_data)
 {
+	char line[64];
+
 	ARG_UNUSED(user_data);
 
 	switch (event) {
 	case BUTTON_CONTROL_EVENT_PAIR_SHORT_PRESS:
 		atomic_inc(&pair_short_press_count);
-		activity_pulse();
+		snprintk(line, sizeof(line), "BUTTON,PAIR_SHORT,count=%ld\r\n",
+			 (long)atomic_get(&pair_short_press_count));
+		nus_send_text(line);
 		break;
 	case BUTTON_CONTROL_EVENT_ENTER_PAIR_MODE:
 		atomic_inc(&pair_mode_request_count);
-		activity_pulse();
+		snprintk(line, sizeof(line), "BUTTON,ENTER_PAIR_MODE,count=%ld\r\n",
+			 (long)atomic_get(&pair_mode_request_count));
+		nus_send_text(line);
 		break;
 	case BUTTON_CONTROL_EVENT_CLEAR_BONDS_REQUESTED:
 		atomic_inc(&clear_bonds_request_count);
-		activity_pulse();
+		snprintk(line, sizeof(line), "BUTTON,CLEAR_BONDS_REQUESTED,count=%ld\r\n",
+			 (long)atomic_get(&clear_bonds_request_count));
+		nus_send_text(line);
 		break;
 	default:
 		break;
@@ -538,7 +557,8 @@ int main(void)
 	for (;;) {
 		led_set(&heartbeat_led, (++seq) % 2);
 
-		if (atomic_get(&ble_connected) && current_conn) {
+		if (atomic_get(&ble_connected) && current_conn &&
+		    (seq % STATUS_REPORT_INTERVAL_SECONDS) == 0) {
 			uint16_t ain1_raw = 0;
 			uint16_t ain4_raw = 0;
 			int32_t ain1_mv = 0;
