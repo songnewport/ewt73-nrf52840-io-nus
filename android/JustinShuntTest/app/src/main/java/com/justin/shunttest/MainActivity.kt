@@ -391,11 +391,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
         ledWriteInProgress = true
         ledButton.isEnabled = false
         addLog("LED write requested: ${if (next) "01" else "00"}")
-        if (bondedCount > 0 && isBonded > 0 && securityLevel >= 2) {
-            manager.writeLed(next)
-        } else {
-            manager.writeLedSecure(next)
-        }
+        manager.writeLed(next)
     }
 
     override fun onLiveData(text: String) {
@@ -624,18 +620,6 @@ private class JustinBleManager(
         readCharacteristic(statusCharacteristic)
             .with { _, data -> appCallbacks.onStatus(data.toUtf8()) }
             .fail { _, status -> appCallbacks.onBleLog("Status read failed: $status") }
-            .enqueue()
-    }
-
-    fun writeLedSecure(on: Boolean) {
-        ensureBond()
-            .done {
-                appCallbacks.onBleLog("Bond/encryption ready")
-                writeLed(on)
-            }
-            .fail { _, status ->
-                appCallbacks.onBleError("Pair/encrypt failed: $status. Hold PAIR 5s and try again.")
-            }
             .enqueue()
     }
 
