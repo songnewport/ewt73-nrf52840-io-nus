@@ -12,6 +12,7 @@
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
@@ -504,6 +505,17 @@ static uint32_t refresh_bonded_count(void)
 	return count;
 }
 
+static uint16_t active_uatt_mtu(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (active_conns[i]) {
+			return bt_gatt_get_uatt_mtu(active_conns[i]);
+		}
+	}
+
+	return 0;
+}
+
 struct bond_match_context {
 	const bt_addr_le_t *addr;
 	bool found;
@@ -566,10 +578,11 @@ static void update_jss_status(void)
 	char status[160];
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.1,LIVE_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu",
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.2,MTU=%u,LIVE_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu",
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
 		       (long)atomic_get(&app_led_on),
+		       active_uatt_mtu(),
 		       jss_service_live_notify_enabled() ? 1 : 0,
 		       (unsigned long)jss_service_live_notify_successes(),
 		       (unsigned long)jss_service_live_notify_attempts(),

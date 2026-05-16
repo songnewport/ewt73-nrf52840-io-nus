@@ -191,8 +191,11 @@ class MainActivity : Activity() {
                 BluetoothProfile.STATE_CONNECTED -> {
                     gattRetryCount = 0
                     setState(AppState.DISCOVERING)
-                    addLog("Connected, discovering services")
-                    gatt.discoverServices()
+                    addLog("Connected, requesting MTU")
+                    if (!gatt.requestMtu(247)) {
+                        addLog("MTU request could not start")
+                        gatt.discoverServices()
+                    }
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -201,6 +204,16 @@ class MainActivity : Activity() {
                     setState(AppState.DISCONNECTED)
                 }
             }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                addLog("MTU changed: $mtu")
+            } else {
+                addLog("MTU change failed: $status")
+            }
+            addLog("Discovering services")
+            gatt.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
