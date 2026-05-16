@@ -28,5 +28,9 @@ void jss_service_set_status(const char *text);
 void jss_service_notify_live_data(void);
 void jss_service_notify_status(void);
 bool jss_service_led_on(void);
+bool jss_service_live_notify_enabled(void);
+uint32_t jss_service_live_notify_attempts(void);
+uint32_t jss_service_live_notify_successes(void);
+int jss_service_live_notify_last_err(void);
 
 #endif /* JSS_SERVICE_H_ */

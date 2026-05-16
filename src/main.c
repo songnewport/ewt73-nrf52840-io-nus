@@ -557,12 +557,17 @@ static int store_conn(struct bt_conn *conn)
 
 static void update_jss_status(void)
 {
-	char status[96];
+	char status[160];
 
-	(void)snprintk(status, sizeof(status), "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.0",
+	(void)snprintk(status, sizeof(status),
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.0,LIVE_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d",
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
-		       (long)atomic_get(&app_led_on));
+		       (long)atomic_get(&app_led_on),
+		       jss_service_live_notify_enabled() ? 1 : 0,
+		       (unsigned long)jss_service_live_notify_successes(),
+		       (unsigned long)jss_service_live_notify_attempts(),
+		       jss_service_live_notify_last_err());
 	jss_service_set_status(status);
 	jss_service_notify_status();
 }

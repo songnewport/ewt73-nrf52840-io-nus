@@ -34,6 +34,9 @@ static bool live_notify_enabled;
 static bool status_notify_enabled;
 static const struct bt_gatt_attr *live_data_attr;
 static const struct bt_gatt_attr *device_status_attr;
+static uint32_t live_notify_attempts;
+static uint32_t live_notify_successes;
+static int live_notify_last_err;
 
 static ssize_t read_text(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			 void *buf, uint16_t len, uint16_t offset)
@@ -153,15 +156,24 @@ void jss_service_set_status(const char *text)
 
 void jss_service_notify_live_data(void)
 {
+	int err;
+
 	if (!live_notify_enabled) {
+		live_notify_last_err = -EACCES;
 		return;
 	}
 
 	if (!live_data_attr) {
+		live_notify_last_err = -ENOENT;
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, live_data_attr, live_data, strlen(live_data));
+	live_notify_attempts++;
+	err = bt_gatt_notify(NULL, live_data_attr, live_data, strlen(live_data));
+	live_notify_last_err = err;
+	if (!err) {
+		live_notify_successes++;
+	}
 }
 
 void jss_service_notify_status(void)
@@ -180,4 +192,24 @@ void jss_service_notify_status(void)
 bool jss_service_led_on(void)
 {
 	return led_on;
+}
+
+bool jss_service_live_notify_enabled(void)
+{
+	return live_notify_enabled;
+}
+
+uint32_t jss_service_live_notify_attempts(void)
+{
+	return live_notify_attempts;
+}
+
+uint32_t jss_service_live_notify_successes(void)
+{
+	return live_notify_successes;
+}
+
+int jss_service_live_notify_last_err(void)
+{
+	return live_notify_last_err;
 }
