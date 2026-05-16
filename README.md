@@ -7,6 +7,23 @@ BLE device name: `Justin_Shunt_Test`
 This project advertises Nordic UART Service for debug and a custom Justin Smart
 Shunt Test GATT service for product-flow security testing.
 
+## Mandatory Development Rule
+
+BLE, GATT, bonding, advertising, GPIO, ADC, I2C, and power-management changes
+must be based on official Nordic/Zephyr examples first.
+
+Workflow:
+
+1. Identify the closest official Nordic or Zephyr sample.
+2. Compare this project's code against that sample before changing code.
+3. Prefer copying the official pattern directly for the first working version.
+4. After the official baseline works on hardware, make the smallest product
+   specific modification.
+5. When debugging, explain which official sample was used as the reference and
+   what the exact difference is.
+
+Do not debug BLE/security behavior by trying unrelated code changes first.
+
 Known-good result on 2026-05-15:
 
 ```text
