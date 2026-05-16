@@ -6,17 +6,11 @@ import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Typeface
@@ -25,13 +19,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
-import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import no.nordicsemi.android.ble.BleManager
+import no.nordicsemi.android.ble.observer.ConnectionObserver
 import java.text.SimpleDateFormat
-import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
@@ -41,22 +35,23 @@ private enum class AppState {
     REQUEST_PERMISSIONS,
     WAIT_PAIR_BUTTON,
     SCANNING,
-    BONDING,
     CONNECTING,
     DISCOVERING,
-    SUBSCRIBING,
     CONNECTED,
     DISCONNECTED,
     ERROR
 }
 
-class MainActivity : Activity() {
-    private val serviceUuid = UUID.fromString("12345678-1234-5678-1234-56789abcdef0")
-    private val liveDataUuid = UUID.fromString("12345678-1234-5678-1234-56789abcdef1")
-    private val ledControlUuid = UUID.fromString("12345678-1234-5678-1234-56789abcdef2")
-    private val statusUuid = UUID.fromString("12345678-1234-5678-1234-56789abcdef3")
-    private val cccUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+private val JUSTIN_SERVICE_UUID: UUID =
+    UUID.fromString("12345678-1234-5678-1234-56789abcdef0")
+private val LIVE_DATA_UUID: UUID =
+    UUID.fromString("12345678-1234-5678-1234-56789abcdef1")
+private val LED_CONTROL_UUID: UUID =
+    UUID.fromString("12345678-1234-5678-1234-56789abcdef2")
+private val STATUS_UUID: UUID =
+    UUID.fromString("12345678-1234-5678-1234-56789abcdef3")
 
+class MainActivity : Activity(), JustinBleCallbacks {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
     private lateinit var prefs: SharedPreferences
@@ -64,26 +59,15 @@ class MainActivity : Activity() {
 
     private var state = AppState.IDLE
     private var selectedDevice: BluetoothDevice? = null
-    private var gatt: BluetoothGatt? = null
-    private var liveCharacteristic: BluetoothGattCharacteristic? = null
-    private var statusCharacteristic: BluetoothGattCharacteristic? = null
-    private var ledCharacteristic: BluetoothGattCharacteristic? = null
+    private var bleManager: JustinBleManager? = null
     private var ledOn = false
     private var isScanning = false
     private var scanSession = 0
     private var connectSession = 0
-    private var gattRetryCount = 0
-    private var liveNotifyCount = 0
-    private var liveReadFallbackActive = false
-    private var readInProgress = false
-    private var descriptorWriteInProgress = false
-    private var bondInProgress = false
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
-    private val notifyQueue = ArrayDeque<BluetoothGattCharacteristic>()
 
     private lateinit var root: LinearLayout
-    private lateinit var titleView: TextView
     private lateinit var stateView: TextView
     private lateinit var connectionView: TextView
     private lateinit var liveView: TextView
@@ -109,7 +93,7 @@ class MainActivity : Activity() {
             val device = result.device ?: return
             val name = result.scanRecord?.deviceName ?: device.name ?: ""
             val matchesName = name.startsWith("Justin_Shunt")
-            val matchesService = result.scanRecord?.serviceUuids?.any { it.uuid == serviceUuid } == true
+            val matchesService = result.scanRecord?.serviceUuids?.any { it.uuid == JUSTIN_SERVICE_UUID } == true
 
             if (!matchesName && !matchesService) {
                 return
@@ -121,244 +105,7 @@ class MainActivity : Activity() {
 
         override fun onScanFailed(errorCode: Int) {
             isScanning = false
-            if (errorCode == ScanCallback.SCAN_FAILED_ALREADY_STARTED) {
-                addLog("Scan already started")
-                setState(AppState.SCANNING)
-            } else {
-                showError("Scan failed: $errorCode")
-            }
-        }
-    }
-
-    private val bondReceiver = object : BroadcastReceiver() {
-        @SuppressLint("MissingPermission")
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
-                return
-            }
-
-            val device = if (Build.VERSION.SDK_INT >= 33) {
-                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-            } ?: return
-
-            if (device.address != selectedDevice?.address) {
-                return
-            }
-
-            val previousBondState = intent.getIntExtra(
-                BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
-                BluetoothDevice.ERROR
-            )
-
-            when (device.bondState) {
-                BluetoothDevice.BOND_BONDING -> {
-                    bondInProgress = true
-                    setState(AppState.BONDING)
-                    addLog("Pairing requested by Android")
-                }
-
-                BluetoothDevice.BOND_BONDED -> {
-                    bondInProgress = false
-                    rememberDevice(device)
-                    addLog("Bonded: ${device.address}")
-                    if (gatt == null) {
-                        setState(AppState.CONNECTING)
-                        connectGattDelayed(device, 1000)
-                    } else {
-                        setState(AppState.CONNECTED)
-                        readStatus()
-                    }
-                }
-
-                BluetoothDevice.BOND_NONE -> {
-                    bondInProgress = false
-                    if (previousBondState == BluetoothDevice.BOND_BONDING) {
-                        showError("Pairing failed or cancelled. Hold PAIR 5s and try again.")
-                    } else {
-                        addLog("Bond state is none: ${device.address}")
-                    }
-                }
-            }
-        }
-    }
-
-    private val gattCallback = object : BluetoothGattCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                addLog("GATT error: $status")
-                val device = selectedDevice
-                closeGatt()
-                setState(AppState.DISCONNECTED)
-                if (device != null && isLikelyStaleBondError(status)) {
-                    clearStaleBond(device)
-                    return
-                }
-                if (status == 133 && device != null && gattRetryCount == 0) {
-                    gattRetryCount++
-                    addLog("Retrying GATT once after 133")
-                    connectGattDelayed(device, 1200)
-                }
-                return
-            }
-
-            when (newState) {
-                BluetoothProfile.STATE_CONNECTED -> {
-                    gattRetryCount = 0
-                    setState(AppState.DISCOVERING)
-                    addLog("Connected, requesting MTU")
-                    if (!gatt.requestMtu(247)) {
-                        addLog("MTU request could not start")
-                        gatt.discoverServices()
-                    }
-                }
-
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    addLog("Disconnected")
-                    closeGatt()
-                    setState(AppState.DISCONNECTED)
-                }
-            }
-        }
-
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                addLog("MTU changed: $mtu")
-            } else {
-                addLog("MTU change failed: $status")
-            }
-            addLog("Discovering services")
-            gatt.discoverServices()
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                showError("Service discovery failed: $status")
-                return
-            }
-
-            val service = gatt.getService(serviceUuid)
-            if (service == null) {
-                showError("Custom Justin service not found")
-                return
-            }
-
-            liveCharacteristic = service.getCharacteristic(liveDataUuid)
-            statusCharacteristic = service.getCharacteristic(statusUuid)
-            ledCharacteristic = service.getCharacteristic(ledControlUuid)
-
-            if (liveCharacteristic == null || statusCharacteristic == null || ledCharacteristic == null) {
-                showError("Required characteristic missing")
-                return
-            }
-
-            setState(AppState.SUBSCRIBING)
-            addLog("Subscribing live data and status")
-            enqueueNotification(liveCharacteristic)
-            enqueueNotification(statusCharacteristic)
-            processNextNotification(gatt)
-        }
-
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt,
-            descriptor: BluetoothGattDescriptor,
-            status: Int
-        ) {
-            descriptorWriteInProgress = false
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                showError("Notification subscribe failed: $status")
-                return
-            }
-
-            val name = when (descriptor.characteristic?.uuid) {
-                liveDataUuid -> "Live data"
-                statusUuid -> "Device status"
-                else -> "Characteristic"
-            }
-            addLog("$name notifications enabled")
-
-            if (notifyQueue.isEmpty()) {
-                setState(AppState.CONNECTED)
-                readLiveData()
-                mainHandler.postDelayed({ readStatus() }, 300)
-                startLiveReadFallback()
-            } else {
-                processNextNotification(gatt)
-            }
-        }
-
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray
-        ) {
-            if (characteristic.uuid == liveDataUuid) {
-                liveNotifyCount++
-            }
-            handleCharacteristicText(characteristic.uuid, value.decodeToString())
-        }
-
-        @Deprecated("Used on Android 12 and older")
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            if (characteristic.uuid == liveDataUuid) {
-                liveNotifyCount++
-            }
-            @Suppress("DEPRECATION")
-            handleCharacteristicText(characteristic.uuid, characteristic.value?.decodeToString().orEmpty())
-        }
-
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-            status: Int
-        ) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                handleCharacteristicText(characteristic.uuid, value.decodeToString())
-            } else {
-                readInProgress = false
-                addLog("Read failed: $status")
-            }
-        }
-
-        @Deprecated("Used on Android 12 and older")
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
-        ) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                @Suppress("DEPRECATION")
-                handleCharacteristicText(characteristic.uuid, characteristic.value?.decodeToString().orEmpty())
-            } else {
-                readInProgress = false
-                addLog("Read failed: $status")
-            }
-        }
-
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
-        ) {
-            if (characteristic.uuid != ledControlUuid) {
-                return
-            }
-
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                addLog("LED write OK: ${if (ledOn) "01" else "00"}")
-                readStatus()
-            } else {
-                addLog("LED write failed: $status")
-                ledOn = !ledOn
-                renderLedButton()
-            }
+            showError(if (errorCode == 1) "Scan already started" else "Scan failed: $errorCode")
         }
     }
 
@@ -366,7 +113,6 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("justin_shunt_ble", Context.MODE_PRIVATE)
         bluetoothAdapter = getSystemService(BluetoothManager::class.java).adapter
-        registerReceiver(bondReceiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
         buildUi()
 
         if (!hasPermissions()) {
@@ -379,9 +125,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        unregisterReceiver(bondReceiver)
         stopScan()
-        closeGatt()
+        closeManager()
     }
 
     override fun onRequestPermissionsResult(
@@ -405,7 +150,7 @@ class MainActivity : Activity() {
             selectedDevice = device
             connectionView.text = "Saved device: $savedAddress"
             addLog("Connecting saved device")
-            connectGattDelayed(device, 500)
+            connectDevice(device)
             return
         }
 
@@ -419,7 +164,6 @@ class MainActivity : Activity() {
             setPadding(28, 28, 28, 28)
         }
 
-        titleView = titleText("Justin Shunt Test", 25f)
         stateView = bodyText()
         connectionView = bodyText()
         liveView = monoPanel("Live data waiting...")
@@ -432,14 +176,14 @@ class MainActivity : Activity() {
             setOnClickListener { startScan() }
         }
         ledButton = Button(this).apply {
-            text = "LED ON"
+            text = "P19 LED ON"
             isEnabled = false
             setOnClickListener { toggleLed() }
         }
         readStatusButton = Button(this).apply {
             text = "Read Status"
             isEnabled = false
-            setOnClickListener { readStatus() }
+            setOnClickListener { bleManager?.readStatus() }
         }
         forgetButton = Button(this).apply {
             text = "Forget Saved Device"
@@ -450,7 +194,7 @@ class MainActivity : Activity() {
             setOnClickListener { clearLog() }
         }
 
-        root.addView(titleView)
+        root.addView(titleText("Justin Shunt Test", 25f))
         root.addView(stateView)
         root.addView(connectionView)
         root.addView(buttonRow(scanButton, ledButton))
@@ -521,7 +265,7 @@ class MainActivity : Activity() {
             return
         }
 
-        closeGatt()
+        closeManager()
         connectSession++
         stopScan()
         val thisScanSession = ++scanSession
@@ -555,7 +299,8 @@ class MainActivity : Activity() {
                     setOnClickListener {
                         stopScan()
                         selectedDevice = device
-                        connectSelectedDevice(device)
+                        rememberDevice(device)
+                        connectDevice(device)
                     }
                 })
             }
@@ -563,178 +308,94 @@ class MainActivity : Activity() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun connectSelectedDevice(device: BluetoothDevice) {
-        connectionView.text = "${device.address} / bond=${bondStateName(device.bondState)}"
-        rememberDevice(device)
-        connectGattDelayed(device, 500)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun connectGatt(device: BluetoothDevice) {
+    private fun connectDevice(device: BluetoothDevice) {
         stopScan()
-        closeGatt()
-        liveNotifyCount = 0
+        closeManager()
         selectedDevice = device
         setState(AppState.CONNECTING)
-        connectionView.text = "Connecting ${device.address}"
-        gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-    }
+        connectionView.text = "Connecting ${device.address} / bond=${bondStateName(device.bondState)}"
 
-    private fun connectGattDelayed(device: BluetoothDevice, delayMs: Long) {
         val thisConnectSession = ++connectSession
-        addLog("Connect scheduled in ${delayMs}ms")
-        mainHandler.postDelayed({
-            if (connectSession == thisConnectSession) {
-                connectGatt(device)
+        val manager = JustinBleManager(this, this).also { bleManager = it }
+        manager.setConnectionObserver(object : ConnectionObserver {
+            override fun onDeviceConnecting(device: BluetoothDevice) {
+                if (connectSession == thisConnectSession) {
+                    setState(AppState.CONNECTING)
+                    addLog("Connecting")
+                }
             }
-        }, delayMs)
+
+            override fun onDeviceConnected(device: BluetoothDevice) {
+                if (connectSession == thisConnectSession) {
+                    setState(AppState.DISCOVERING)
+                    addLog("Connected, Nordic manager discovering services")
+                }
+            }
+
+            override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) {
+                if (connectSession == thisConnectSession) {
+                    showError("Connect failed: $reason")
+                }
+            }
+
+            override fun onDeviceReady(device: BluetoothDevice) {
+                if (connectSession == thisConnectSession) {
+                    setState(AppState.CONNECTED)
+                    rememberDevice(device)
+                    connectionView.text = "Connected ${device.address}"
+                    addLog("Device ready")
+                    manager.readLiveData()
+                    manager.readStatus()
+                }
+            }
+
+            override fun onDeviceDisconnecting(device: BluetoothDevice) {
+                addLog("Disconnecting")
+            }
+
+            override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+                if (connectSession == thisConnectSession) {
+                    setState(AppState.DISCONNECTED)
+                    addLog("Disconnected: $reason")
+                }
+            }
+        })
+
+        manager.connect(device)
+            .retry(3, 300)
+            .timeout(15000)
+            .fail { _, status -> showError("Connect/init failed: $status") }
+            .enqueue()
     }
 
-    private fun enqueueNotification(characteristic: BluetoothGattCharacteristic?) {
-        if (characteristic != null) {
-            notifyQueue.add(characteristic)
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun processNextNotification(gatt: BluetoothGatt) {
-        if (descriptorWriteInProgress) {
-            return
-        }
-
-        val characteristic = if (notifyQueue.isEmpty()) null else notifyQueue.removeFirst()
-        if (characteristic == null) {
-            setState(AppState.CONNECTED)
-            readStatus()
-            return
-        }
-
-        val descriptor = characteristic.getDescriptor(cccUuid)
-        if (descriptor == null) {
-            showError("CCC descriptor missing")
-            return
-        }
-
-        gatt.setCharacteristicNotification(characteristic, true)
-        descriptorWriteInProgress = true
-        val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        val started = if (Build.VERSION.SDK_INT >= 33) {
-            gatt.writeDescriptor(descriptor, value) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            descriptor.value = value
-            @Suppress("DEPRECATION")
-            gatt.writeDescriptor(descriptor)
-        }
-
-        if (!started) {
-            descriptorWriteInProgress = false
-            showError("Failed to start descriptor write")
-        }
-    }
-
-    @SuppressLint("MissingPermission")
     private fun toggleLed() {
-        val currentGatt = gatt ?: return
-        val characteristic = ledCharacteristic ?: return
-        val device = selectedDevice
-        if (device != null && device.bondState != BluetoothDevice.BOND_BONDED) {
-            requestPairForLed(device)
-            return
-        }
+        val manager = bleManager ?: return
+        val next = !ledOn
+        addLog("LED secure write requested: ${if (next) "01" else "00"}")
+        manager.writeLedSecure(next)
+    }
 
-        ledOn = !ledOn
+    override fun onLiveData(text: String) {
+        showLiveData(text)
+    }
+
+    override fun onStatus(text: String) {
+        showStatus(text)
+    }
+
+    override fun onLedWriteDone(on: Boolean) {
+        ledOn = on
         renderLedButton()
-        val value = byteArrayOf(if (ledOn) 0x01 else 0x00)
-
-        val started = if (Build.VERSION.SDK_INT >= 33) {
-            currentGatt.writeCharacteristic(
-                characteristic,
-                value,
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            ) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            characteristic.value = value
-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            @Suppress("DEPRECATION")
-            currentGatt.writeCharacteristic(characteristic)
-        }
-
-        if (!started) {
-            ledOn = !ledOn
-            renderLedButton()
-            addLog("LED write could not start")
-        }
+        addLog("LED write OK: ${if (on) "01" else "00"}")
+        bleManager?.readStatus()
     }
 
-    @SuppressLint("MissingPermission")
-    private fun requestPairForLed(device: BluetoothDevice) {
-        if (device.bondState == BluetoothDevice.BOND_BONDING || bondInProgress) {
-            addLog("Pairing already in progress")
-            return
-        }
-
-        setState(AppState.BONDING)
-        addLog("LED control requires bond. Hold PAIR, then confirm pairing.")
-        addLog("createBond()")
-        bondInProgress = true
-        if (!device.createBond()) {
-            bondInProgress = false
-            showError("createBond() returned false")
-        }
+    override fun onBleLog(message: String) {
+        addLog(message)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun readStatus() {
-        val currentGatt = gatt ?: return
-        val characteristic = statusCharacteristic ?: return
-        if (readInProgress) {
-            return
-        }
-        readInProgress = true
-        currentGatt.readCharacteristic(characteristic)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun readLiveData() {
-        val currentGatt = gatt ?: return
-        val characteristic = liveCharacteristic ?: return
-        if (readInProgress) {
-            return
-        }
-        readInProgress = true
-        currentGatt.readCharacteristic(characteristic)
-    }
-
-    private fun handleCharacteristicText(uuid: UUID, text: String) {
-        readInProgress = false
-        if (text.isBlank()) {
-            return
-        }
-
-        when (uuid) {
-            liveDataUuid -> showLiveData(text)
-            statusUuid -> showStatus(text)
-        }
-    }
-
-    private fun startLiveReadFallback() {
-        val thisConnectSession = connectSession
-        liveReadFallbackActive = true
-        mainHandler.postDelayed(object : Runnable {
-            override fun run() {
-                if (!liveReadFallbackActive || connectSession != thisConnectSession) {
-                    return
-                }
-
-                if (state == AppState.CONNECTED && liveNotifyCount == 0) {
-                    addLog("Live notify missing, reading live data")
-                    readLiveData()
-                    mainHandler.postDelayed(this, 1000)
-                }
-            }
-        }, 3000)
+    override fun onBleError(message: String) {
+        showError(message)
     }
 
     private fun showLiveData(text: String) {
@@ -774,11 +435,7 @@ class MainActivity : Activity() {
     private fun parseFields(text: String): Map<String, String> {
         return text.split(",").mapNotNull { token ->
             val parts = token.split("=", limit = 2)
-            if (parts.size == 2) {
-                parts[0].trim() to parts[1].trim()
-            } else {
-                null
-            }
+            if (parts.size == 2) parts[0].trim() to parts[1].trim() else null
         }.toMap()
     }
 
@@ -826,18 +483,10 @@ class MainActivity : Activity() {
         isScanning = false
     }
 
-    private fun closeGatt() {
-        notifyQueue.clear()
-        descriptorWriteInProgress = false
-        liveReadFallbackActive = false
-        liveNotifyCount = 0
-        bondInProgress = false
-        readInProgress = false
-        gatt?.close()
-        gatt = null
-        liveCharacteristic = null
-        statusCharacteristic = null
-        ledCharacteristic = null
+    private fun closeManager() {
+        val manager = bleManager
+        bleManager = null
+        manager?.disconnect()?.then { manager.close() }?.enqueue()
         mainHandler.post {
             ledButton.isEnabled = false
             readStatusButton.isEnabled = false
@@ -853,66 +502,18 @@ class MainActivity : Activity() {
     }
 
     private fun forgetSavedDevice() {
-        removeKnownBonds()
+        val manager = bleManager
         prefs.edit().clear().apply()
         selectedDevice = null
         connectSession++
-        closeGatt()
+        if (manager != null) {
+            manager.removeBondAndDisconnect()
+        } else {
+            closeManager()
+        }
         setState(AppState.WAIT_PAIR_BUTTON)
         connectionView.text = "Saved device cleared. Hold PAIR 5s, then scan."
         addLog("Saved device cleared")
-    }
-
-    private fun isLikelyStaleBondError(status: Int): Boolean {
-        return status == 5 || status == 8 || status == 22 || status == 133
-    }
-
-    private fun clearStaleBond(device: BluetoothDevice) {
-        if (removeBond(device)) {
-            addLog("Stale Android bond removed: ${device.address}")
-        } else {
-            addLog("Stale Android bond clear requested: ${device.address}")
-        }
-        prefs.edit().clear().apply()
-        selectedDevice = null
-        connectSession++
-        setState(AppState.WAIT_PAIR_BUTTON)
-        connectionView.text = "Bond reset. Hold PAIR 5s, then scan/connect again."
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun removeKnownBonds() {
-        if (!hasPermissions()) {
-            return
-        }
-
-        val savedAddress = prefs.getString("device_address", null)
-        val selectedAddress = selectedDevice?.address
-        val candidates = bluetoothAdapter.bondedDevices.filter { device ->
-            val name = device.name.orEmpty()
-            device.address == savedAddress ||
-                device.address == selectedAddress ||
-                name.startsWith("Justin_Shunt", ignoreCase = true)
-        }
-
-        candidates.forEach { device ->
-            if (removeBond(device)) {
-                addLog("Android bond removed: ${device.address}")
-            } else {
-                addLog("Android bond remove failed: ${device.address}")
-            }
-        }
-    }
-
-    private fun removeBond(device: BluetoothDevice): Boolean {
-        return try {
-            val method = device.javaClass.getMethod("removeBond")
-            method.invoke(device) as? Boolean ?: false
-        } catch (_: ReflectiveOperationException) {
-            false
-        } catch (_: SecurityException) {
-            false
-        }
     }
 
     private fun bondStateName(state: Int): String {
@@ -929,4 +530,107 @@ class MainActivity : Activity() {
             checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         }
     }
+}
+
+private interface JustinBleCallbacks {
+    fun onLiveData(text: String)
+    fun onStatus(text: String)
+    fun onLedWriteDone(on: Boolean)
+    fun onBleLog(message: String)
+    fun onBleError(message: String)
+}
+
+private class JustinBleManager(
+    context: Context,
+    private val appCallbacks: JustinBleCallbacks
+) : BleManager(context) {
+    private var liveCharacteristic: BluetoothGattCharacteristic? = null
+    private var ledCharacteristic: BluetoothGattCharacteristic? = null
+    private var statusCharacteristic: BluetoothGattCharacteristic? = null
+
+    override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
+        val service = gatt.getService(JUSTIN_SERVICE_UUID) ?: return false
+        liveCharacteristic = service.getCharacteristic(LIVE_DATA_UUID)
+        ledCharacteristic = service.getCharacteristic(LED_CONTROL_UUID)
+        statusCharacteristic = service.getCharacteristic(STATUS_UUID)
+        return liveCharacteristic != null && ledCharacteristic != null && statusCharacteristic != null
+    }
+
+    override fun initialize() {
+        requestMtu(247)
+            .with { _, mtu -> appCallbacks.onBleLog("MTU changed: $mtu") }
+            .fail { _, status -> appCallbacks.onBleLog("MTU request failed: $status") }
+            .enqueue()
+
+        setNotificationCallback(liveCharacteristic)
+            .with { _, data -> appCallbacks.onLiveData(data.toUtf8()) }
+        enableNotifications(liveCharacteristic)
+            .done { appCallbacks.onBleLog("Live data notifications enabled") }
+            .fail { _, status -> appCallbacks.onBleError("Live notification enable failed: $status") }
+            .enqueue()
+
+        setNotificationCallback(statusCharacteristic)
+            .with { _, data -> appCallbacks.onStatus(data.toUtf8()) }
+        enableNotifications(statusCharacteristic)
+            .done { appCallbacks.onBleLog("Device status notifications enabled") }
+            .fail { _, status -> appCallbacks.onBleError("Status notification enable failed: $status") }
+            .enqueue()
+    }
+
+    override fun onServicesInvalidated() {
+        liveCharacteristic = null
+        ledCharacteristic = null
+        statusCharacteristic = null
+    }
+
+    fun readLiveData() {
+        readCharacteristic(liveCharacteristic)
+            .with { _, data -> appCallbacks.onLiveData(data.toUtf8()) }
+            .fail { _, status -> appCallbacks.onBleLog("Live read failed: $status") }
+            .enqueue()
+    }
+
+    fun readStatus() {
+        readCharacteristic(statusCharacteristic)
+            .with { _, data -> appCallbacks.onStatus(data.toUtf8()) }
+            .fail { _, status -> appCallbacks.onBleLog("Status read failed: $status") }
+            .enqueue()
+    }
+
+    fun writeLedSecure(on: Boolean) {
+        ensureBond()
+            .done {
+                appCallbacks.onBleLog("Bond/encryption ready")
+                writeLed(on)
+            }
+            .fail { _, status ->
+                appCallbacks.onBleError("Pair/encrypt failed: $status. Hold PAIR 5s and try again.")
+            }
+            .enqueue()
+    }
+
+    fun removeBondAndDisconnect() {
+        removeBond()
+            .done { appCallbacks.onBleLog("Android bond removed") }
+            .fail { _, status -> appCallbacks.onBleLog("Remove bond failed: $status") }
+            .then {
+                disconnect().then { close() }.enqueue()
+            }
+            .enqueue()
+    }
+
+    private fun writeLed(on: Boolean) {
+        writeCharacteristic(
+            ledCharacteristic,
+            byteArrayOf(if (on) 0x01 else 0x00),
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        )
+            .done { appCallbacks.onLedWriteDone(on) }
+            .fail { _, status -> appCallbacks.onBleError("LED write failed: $status") }
+            .enqueue()
+    }
+}
+
+private fun no.nordicsemi.android.ble.data.Data.toUtf8(): String {
+    return value?.decodeToString().orEmpty()
 }
