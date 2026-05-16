@@ -19,6 +19,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -29,20 +30,23 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.text.SimpleDateFormat
+import java.util.ArrayDeque
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
-enum class AppState {
+private enum class AppState {
     IDLE,
     REQUEST_PERMISSIONS,
     WAIT_PAIR_BUTTON,
     SCANNING,
-    FOUND_DEVICE,
     BONDING,
-    BONDED,
-    CONNECTING_GATT,
-    DISCOVERING_SERVICES,
+    CONNECTING,
+    DISCOVERING,
     SUBSCRIBING,
-    HOME_CONNECTED,
+    CONNECTED,
+    DISCONNECTED,
     ERROR
 }
 
@@ -54,24 +58,34 @@ class MainActivity : Activity() {
     private val cccUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
     private lateinit var prefs: SharedPreferences
     private lateinit var bluetoothAdapter: BluetoothAdapter
 
     private var state = AppState.IDLE
     private var selectedDevice: BluetoothDevice? = null
     private var gatt: BluetoothGatt? = null
+    private var liveCharacteristic: BluetoothGattCharacteristic? = null
+    private var statusCharacteristic: BluetoothGattCharacteristic? = null
     private var ledCharacteristic: BluetoothGattCharacteristic? = null
     private var ledOn = false
+    private var descriptorWriteInProgress = false
+
+    private val foundDevices = linkedMapOf<String, ScanResult>()
+    private val notifyQueue = ArrayDeque<BluetoothGattCharacteristic>()
 
     private lateinit var root: LinearLayout
     private lateinit var titleView: TextView
     private lateinit var stateView: TextView
-    private lateinit var dataView: TextView
+    private lateinit var connectionView: TextView
+    private lateinit var liveView: TextView
+    private lateinit var statusView: TextView
+    private lateinit var devicesView: LinearLayout
     private lateinit var logView: TextView
-    private lateinit var primaryButton: Button
+    private lateinit var scanButton: Button
     private lateinit var ledButton: Button
-
-    private val foundDevices = linkedMapOf<String, ScanResult>()
+    private lateinit var readStatusButton: Button
+    private lateinit var forgetButton: Button
 
     private val requiredPermissions: Array<String>
         get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -93,12 +107,11 @@ class MainActivity : Activity() {
             }
 
             foundDevices[device.address] = result
-            setState(AppState.FOUND_DEVICE)
-            showDeviceList()
+            renderDevices()
         }
 
         override fun onScanFailed(errorCode: Int) {
-            setError("Scan failed: $errorCode")
+            showError("Scan failed: $errorCode")
         }
     }
 
@@ -123,22 +136,18 @@ class MainActivity : Activity() {
             when (device.bondState) {
                 BluetoothDevice.BOND_BONDING -> {
                     setState(AppState.BONDING)
-                    appendLog("Pairing...")
+                    addLog("Pairing requested by Android")
                 }
 
                 BluetoothDevice.BOND_BONDED -> {
-                    setState(AppState.BONDED)
-                    prefs.edit()
-                        .putString("device_address", device.address)
-                        .putString("device_name", device.name ?: "Justin_Shunt_Test")
-                        .putLong("last_connected", System.currentTimeMillis())
-                        .apply()
-                    appendLog("Bonded successfully")
+                    rememberDevice(device)
+                    setState(AppState.CONNECTING)
+                    addLog("Bonded: ${device.address}")
                     connectGatt(device)
                 }
 
                 BluetoothDevice.BOND_NONE -> {
-                    setError("Pairing failed or was cancelled")
+                    showError("Pairing failed or cancelled. Hold PAIR 5s and try again.")
                 }
             }
         }
@@ -148,61 +157,53 @@ class MainActivity : Activity() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                setError("GATT connection error: $status")
+                addLog("GATT error: $status")
                 closeGatt()
+                setState(AppState.DISCONNECTED)
                 return
             }
 
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                setState(AppState.DISCOVERING_SERVICES)
-                appendLog("Connected, discovering services")
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                appendLog("Disconnected")
-                closeGatt()
-                setState(AppState.WAIT_PAIR_BUTTON)
-                renderIntro()
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    setState(AppState.DISCOVERING)
+                    addLog("Connected, discovering services")
+                    gatt.discoverServices()
+                }
+
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    addLog("Disconnected")
+                    closeGatt()
+                    setState(AppState.DISCONNECTED)
+                }
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                setError("Service discovery failed: $status")
+                showError("Service discovery failed: $status")
                 return
             }
 
             val service = gatt.getService(serviceUuid)
             if (service == null) {
-                setError("Justin Smart Shunt service not found")
+                showError("Custom Justin service not found")
                 return
             }
 
+            liveCharacteristic = service.getCharacteristic(liveDataUuid)
+            statusCharacteristic = service.getCharacteristic(statusUuid)
             ledCharacteristic = service.getCharacteristic(ledControlUuid)
-            val live = service.getCharacteristic(liveDataUuid)
-            if (ledCharacteristic == null || live == null) {
-                setError("Required characteristic not found")
+
+            if (liveCharacteristic == null || statusCharacteristic == null || ledCharacteristic == null) {
+                showError("Required characteristic missing")
                 return
             }
 
             setState(AppState.SUBSCRIBING)
-            subscribeToLiveData(gatt, live)
-        }
-
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray
-        ) {
-            handleLiveText(value.decodeToString())
-        }
-
-        @Deprecated("Used on older Android releases")
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            @Suppress("DEPRECATION")
-            handleLiveText(characteristic.value?.decodeToString().orEmpty())
+            addLog("Subscribing live data and status")
+            enqueueNotification(liveCharacteristic)
+            enqueueNotification(statusCharacteristic)
+            processNextNotification(gatt)
         }
 
         override fun onDescriptorWrite(
@@ -210,14 +211,68 @@ class MainActivity : Activity() {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            if (descriptor.uuid == cccUuid) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    setState(AppState.HOME_CONNECTED)
-                    appendLog("Live data subscribed")
-                    renderHome()
-                } else {
-                    setError("Subscribe failed: $status")
-                }
+            descriptorWriteInProgress = false
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                showError("Notification subscribe failed: $status")
+                return
+            }
+
+            val name = when (descriptor.characteristic?.uuid) {
+                liveDataUuid -> "Live data"
+                statusUuid -> "Device status"
+                else -> "Characteristic"
+            }
+            addLog("$name notifications enabled")
+
+            if (notifyQueue.isEmpty()) {
+                setState(AppState.CONNECTED)
+                readStatus()
+            } else {
+                processNextNotification(gatt)
+            }
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            handleCharacteristicText(characteristic.uuid, value.decodeToString())
+        }
+
+        @Deprecated("Used on Android 12 and older")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            @Suppress("DEPRECATION")
+            handleCharacteristicText(characteristic.uuid, characteristic.value?.decodeToString().orEmpty())
+        }
+
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                handleCharacteristicText(characteristic.uuid, value.decodeToString())
+            } else {
+                addLog("Read failed: $status")
+            }
+        }
+
+        @Deprecated("Used on Android 12 and older")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                @Suppress("DEPRECATION")
+                handleCharacteristicText(characteristic.uuid, characteristic.value?.decodeToString().orEmpty())
+            } else {
+                addLog("Read failed: $status")
             }
         }
 
@@ -226,12 +281,17 @@ class MainActivity : Activity() {
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
-            if (characteristic.uuid == ledControlUuid) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    appendLog("LED write OK")
-                } else {
-                    appendLog("LED write failed: $status")
-                }
+            if (characteristic.uuid != ledControlUuid) {
+                return
+            }
+
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                addLog("LED write OK: ${if (ledOn) "01" else "00"}")
+                readStatus()
+            } else {
+                addLog("LED write failed: $status")
+                ledOn = !ledOn
+                renderLedButton()
             }
         }
     }
@@ -239,8 +299,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("justin_shunt_ble", Context.MODE_PRIVATE)
-        val manager = getSystemService(BluetoothManager::class.java)
-        bluetoothAdapter = manager.adapter
+        bluetoothAdapter = getSystemService(BluetoothManager::class.java).adapter
         registerReceiver(bondReceiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
         buildUi()
 
@@ -268,7 +327,7 @@ class MainActivity : Activity() {
         if (requestCode == 100 && hasPermissions()) {
             startFlow()
         } else {
-            setError("Bluetooth permissions are required")
+            showError("Bluetooth permission is required")
         }
     }
 
@@ -278,15 +337,16 @@ class MainActivity : Activity() {
         if (savedAddress != null) {
             val device = bluetoothAdapter.getRemoteDevice(savedAddress)
             selectedDevice = device
+            connectionView.text = "Saved device: $savedAddress"
             if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                appendLog("Using saved bonded device: $savedAddress")
+                addLog("Connecting saved bonded device")
                 connectGatt(device)
                 return
             }
         }
 
         setState(AppState.WAIT_PAIR_BUTTON)
-        renderIntro()
+        connectionView.text = "Hold PAIR for 5 seconds, then scan."
     }
 
     private fun buildUi() {
@@ -295,48 +355,93 @@ class MainActivity : Activity() {
             setPadding(28, 28, 28, 28)
         }
 
-        titleView = TextView(this).apply {
-            textSize = 24f
-            text = "Justin Shunt Test"
+        titleView = titleText("Justin Shunt Test", 25f)
+        stateView = bodyText()
+        connectionView = bodyText()
+        liveView = monoPanel("Live data waiting...")
+        statusView = monoPanel("Status waiting...")
+        devicesView = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        logView = monoPanel("")
+
+        scanButton = Button(this).apply {
+            text = "Scan / Reconnect"
+            setOnClickListener { startScan() }
         }
-        stateView = TextView(this).apply { textSize = 15f }
-        dataView = TextView(this).apply {
-            textSize = 20f
-            setPadding(0, 18, 0, 18)
-        }
-        primaryButton = Button(this)
         ledButton = Button(this).apply {
-            visibility = View.GONE
-            text = "Turn LED ON"
+            text = "LED ON"
+            isEnabled = false
             setOnClickListener { toggleLed() }
         }
-        logView = TextView(this).apply {
-            textSize = 13f
-            setPadding(0, 18, 0, 0)
+        readStatusButton = Button(this).apply {
+            text = "Read Status"
+            isEnabled = false
+            setOnClickListener { readStatus() }
+        }
+        forgetButton = Button(this).apply {
+            text = "Forget Saved Device"
+            setOnClickListener { forgetSavedDevice() }
         }
 
         root.addView(titleView)
         root.addView(stateView)
-        root.addView(dataView)
-        root.addView(primaryButton)
-        root.addView(ledButton)
+        root.addView(connectionView)
+        root.addView(buttonRow(scanButton, ledButton))
+        root.addView(buttonRow(readStatusButton, forgetButton))
+        root.addView(sectionLabel("Live Data"))
+        root.addView(liveView)
+        root.addView(sectionLabel("Device Status"))
+        root.addView(statusView)
+        root.addView(sectionLabel("Found Devices"))
+        root.addView(devicesView)
+        root.addView(sectionLabel("Log"))
         root.addView(logView)
 
-        val scroll = ScrollView(this).apply {
+        setContentView(ScrollView(this).apply {
+            isFillViewport = true
             addView(root)
-            fillViewport = true
-        }
-        setContentView(scroll)
+        })
     }
 
-    private fun renderIntro() {
-        mainHandler.post {
-            titleView.text = "Welcome"
-            dataView.text = "Please press and hold the PAIR button on the Smart Shunt for 5 seconds.\n\nWhen the board enters pair mode, tap Continue."
-            primaryButton.text = "Continue / Scan"
-            primaryButton.visibility = View.VISIBLE
-            primaryButton.setOnClickListener { startScan() }
-            ledButton.visibility = View.GONE
+    private fun titleText(textValue: String, size: Float): TextView {
+        return TextView(this).apply {
+            text = textValue
+            textSize = size
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, 12)
+        }
+    }
+
+    private fun sectionLabel(textValue: String): TextView {
+        return TextView(this).apply {
+            text = textValue
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 22, 0, 6)
+        }
+    }
+
+    private fun bodyText(): TextView {
+        return TextView(this).apply {
+            textSize = 15f
+            setPadding(0, 4, 0, 4)
+        }
+    }
+
+    private fun monoPanel(textValue: String): TextView {
+        return TextView(this).apply {
+            text = textValue
+            textSize = 15f
+            typeface = Typeface.MONOSPACE
+            setPadding(18, 14, 18, 14)
+        }
+    }
+
+    private fun buttonRow(left: Button, right: Button): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(left, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
     }
 
@@ -347,35 +452,31 @@ class MainActivity : Activity() {
             return
         }
 
+        closeGatt()
         foundDevices.clear()
+        devicesView.removeAllViews()
         setState(AppState.SCANNING)
-        appendLog("Scanning for Justin_Shunt_Test")
+        connectionView.text = "Scanning for Justin_Shunt_Test..."
+        addLog("Scan started")
         bluetoothAdapter.bluetoothLeScanner.startScan(scanCallback)
+
         mainHandler.postDelayed({
             if (state == AppState.SCANNING && foundDevices.isEmpty()) {
                 stopScan()
-                setError("No device found. Enter pair mode and scan again.")
+                connectionView.text = "No device found. Hold PAIR 5s and scan again."
+                setState(AppState.WAIT_PAIR_BUTTON)
             }
         }, 12000)
-
-        mainHandler.post {
-            titleView.text = "Scanning"
-            dataView.text = "Looking for Justin_Shunt_Test..."
-            primaryButton.visibility = View.GONE
-            ledButton.visibility = View.GONE
-        }
     }
 
     @SuppressLint("MissingPermission")
-    private fun showDeviceList() {
+    private fun renderDevices() {
         mainHandler.post {
-            titleView.text = "Select Device"
-            root.removeViews(3, root.childCount - 3)
-
+            devicesView.removeAllViews()
             foundDevices.values.forEach { result ->
                 val device = result.device
                 val name = result.scanRecord?.deviceName ?: device.name ?: "Unknown"
-                val button = Button(this).apply {
+                devicesView.addView(Button(this).apply {
                     gravity = Gravity.START or Gravity.CENTER_VERTICAL
                     text = "$name\n${device.address}  RSSI ${result.rssi}"
                     setOnClickListener {
@@ -383,26 +484,22 @@ class MainActivity : Activity() {
                         selectedDevice = device
                         bondOrConnect(device)
                     }
-                }
-                root.addView(button)
+                })
             }
-
-            root.addView(ledButton)
-            root.addView(logView)
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun bondOrConnect(device: BluetoothDevice) {
+        connectionView.text = "${device.address} / bond=${bondStateName(device.bondState)}"
         if (device.bondState == BluetoothDevice.BOND_BONDED) {
-            setState(AppState.BONDED)
-            appendLog("Already bonded")
+            rememberDevice(device)
             connectGatt(device)
         } else {
             setState(AppState.BONDING)
-            appendLog("Starting createBond()")
+            addLog("createBond()")
             if (!device.createBond()) {
-                setError("createBond() returned false")
+                showError("createBond() returned false")
             }
         }
     }
@@ -411,110 +508,173 @@ class MainActivity : Activity() {
     private fun connectGatt(device: BluetoothDevice) {
         closeGatt()
         selectedDevice = device
-        setState(AppState.CONNECTING_GATT)
-        appendLog("Connecting GATT: ${device.address}")
+        setState(AppState.CONNECTING)
+        connectionView.text = "Connecting ${device.address}"
         gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
+    private fun enqueueNotification(characteristic: BluetoothGattCharacteristic?) {
+        if (characteristic != null) {
+            notifyQueue.add(characteristic)
+        }
+    }
+
     @SuppressLint("MissingPermission")
-    private fun subscribeToLiveData(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-        gatt.setCharacteristicNotification(characteristic, true)
-        val descriptor = characteristic.getDescriptor(cccUuid)
-        if (descriptor == null) {
-            setError("CCC descriptor not found")
+    private fun processNextNotification(gatt: BluetoothGatt) {
+        if (descriptorWriteInProgress) {
             return
         }
 
+        val characteristic = if (notifyQueue.isEmpty()) null else notifyQueue.removeFirst()
+        if (characteristic == null) {
+            setState(AppState.CONNECTED)
+            readStatus()
+            return
+        }
+
+        val descriptor = characteristic.getDescriptor(cccUuid)
+        if (descriptor == null) {
+            showError("CCC descriptor missing")
+            return
+        }
+
+        gatt.setCharacteristicNotification(characteristic, true)
+        descriptorWriteInProgress = true
         val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        if (Build.VERSION.SDK_INT >= 33) {
-            gatt.writeDescriptor(descriptor, value)
+        val started = if (Build.VERSION.SDK_INT >= 33) {
+            gatt.writeDescriptor(descriptor, value) == BluetoothGatt.GATT_SUCCESS
         } else {
             @Suppress("DEPRECATION")
             descriptor.value = value
             @Suppress("DEPRECATION")
             gatt.writeDescriptor(descriptor)
         }
+
+        if (!started) {
+            descriptorWriteInProgress = false
+            showError("Failed to start descriptor write")
+        }
     }
 
     @SuppressLint("MissingPermission")
     private fun toggleLed() {
-        val g = gatt ?: return
-        val ch = ledCharacteristic ?: return
+        val currentGatt = gatt ?: return
+        val characteristic = ledCharacteristic ?: return
         ledOn = !ledOn
+        renderLedButton()
         val value = byteArrayOf(if (ledOn) 0x01 else 0x00)
-        ledButton.text = if (ledOn) "Turn LED OFF" else "Turn LED ON"
 
-        if (Build.VERSION.SDK_INT >= 33) {
-            g.writeCharacteristic(ch, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+        val started = if (Build.VERSION.SDK_INT >= 33) {
+            currentGatt.writeCharacteristic(
+                characteristic,
+                value,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            ) == BluetoothGatt.GATT_SUCCESS
         } else {
             @Suppress("DEPRECATION")
-            ch.value = value
-            ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            characteristic.value = value
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             @Suppress("DEPRECATION")
-            g.writeCharacteristic(ch)
+            currentGatt.writeCharacteristic(characteristic)
+        }
+
+        if (!started) {
+            ledOn = !ledOn
+            renderLedButton()
+            addLog("LED write could not start")
         }
     }
 
-    private fun renderHome() {
-        mainHandler.post {
-            titleView.text = "Smart Shunt"
-            primaryButton.visibility = View.GONE
-            ledButton.visibility = View.VISIBLE
-            if (dataView.text.isBlank()) {
-                dataView.text = "Waiting for live data..."
-            }
-        }
+    @SuppressLint("MissingPermission")
+    private fun readStatus() {
+        val currentGatt = gatt ?: return
+        val characteristic = statusCharacteristic ?: return
+        currentGatt.readCharacteristic(characteristic)
     }
 
-    private fun handleLiveText(text: String) {
+    private fun handleCharacteristicText(uuid: UUID, text: String) {
         if (text.isBlank()) {
             return
         }
 
-        mainHandler.post {
-            dataView.text = parseLiveText(text)
+        when (uuid) {
+            liveDataUuid -> showLiveData(text)
+            statusUuid -> showStatus(text)
         }
     }
 
-    private fun parseLiveText(text: String): String {
-        val map = text.split(",")
-            .mapNotNull {
-                val parts = it.split("=", limit = 2)
-                if (parts.size == 2) parts[0].trim() to parts[1].trim() else null
-            }
-            .toMap()
+    private fun showLiveData(text: String) {
+        val fields = parseFields(text)
+        mainHandler.post {
+            liveView.text = listOf(
+                "Voltage      ${fields["V"] ?: "--"} V",
+                "Current      ${fields["I"] ?: "--"} mA",
+                "Temperature  ${fields["T"] ?: "--"} C",
+                "SOC          ${fields["SOC"] ?: "--"} %",
+                "",
+                "Raw: $text"
+            ).joinToString("\n")
+        }
+    }
 
-        return listOf(
-            "Voltage: ${map["V"] ?: "--"} V",
-            "Current: ${map["I"] ?: "--"} A",
-            "Temperature: ${map["T"] ?: "--"} C",
-            "SOC: ${map["SOC"] ?: "--"} %",
-            "Connection: Connected / Bonded",
-            "LED State: ${if (ledOn) "ON" else "OFF"}"
-        ).joinToString("\n")
+    private fun showStatus(text: String) {
+        val fields = parseFields(text)
+        val ledValue = fields["LED"]
+        if (ledValue == "0" || ledValue == "1") {
+            ledOn = ledValue == "1"
+            renderLedButton()
+        }
+
+        mainHandler.post {
+            statusView.text = listOf(
+                "Pair mode    ${fields["PAIR_MODE"] ?: "--"}",
+                "Bonded       ${fields["BONDED_COUNT"] ?: "--"}",
+                "P19 LED      ${fields["LED"] ?: "--"}",
+                "Firmware     ${fields["FW"] ?: "--"}",
+                "",
+                "Raw: $text"
+            ).joinToString("\n")
+        }
+    }
+
+    private fun parseFields(text: String): Map<String, String> {
+        return text.split(",").mapNotNull { token ->
+            val parts = token.split("=", limit = 2)
+            if (parts.size == 2) {
+                parts[0].trim() to parts[1].trim()
+            } else {
+                null
+            }
+        }.toMap()
+    }
+
+    private fun renderLedButton() {
+        mainHandler.post {
+            ledButton.text = if (ledOn) "P19 LED OFF" else "P19 LED ON"
+        }
     }
 
     private fun setState(newState: AppState) {
         state = newState
-        mainHandler.post { stateView.text = "State: $newState" }
-    }
-
-    private fun appendLog(message: String) {
         mainHandler.post {
-            logView.append("${System.currentTimeMillis() % 100000}: $message\n")
+            stateView.text = "State: $newState"
+            val connected = newState == AppState.CONNECTED
+            ledButton.isEnabled = connected
+            readStatusButton.isEnabled = connected
         }
     }
 
-    private fun setError(message: String) {
+    private fun showError(message: String) {
         setState(AppState.ERROR)
-        appendLog(message)
+        addLog(message)
         mainHandler.post {
-            titleView.text = "Error"
-            dataView.text = message
-            primaryButton.text = "Restart"
-            primaryButton.visibility = View.VISIBLE
-            primaryButton.setOnClickListener { startFlow() }
-            ledButton.visibility = View.GONE
+            connectionView.text = message
+        }
+    }
+
+    private fun addLog(message: String) {
+        mainHandler.post {
+            logView.append("${timeFormat.format(Date())}  $message\n")
         }
     }
 
@@ -526,12 +686,48 @@ class MainActivity : Activity() {
     }
 
     private fun closeGatt() {
+        notifyQueue.clear()
+        descriptorWriteInProgress = false
         gatt?.close()
         gatt = null
+        liveCharacteristic = null
+        statusCharacteristic = null
         ledCharacteristic = null
+        mainHandler.post {
+            ledButton.isEnabled = false
+            readStatusButton.isEnabled = false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun rememberDevice(device: BluetoothDevice) {
+        prefs.edit()
+            .putString("device_address", device.address)
+            .putString("device_name", device.name ?: "Justin_Shunt_Test")
+            .apply()
+    }
+
+    private fun forgetSavedDevice() {
+        prefs.edit().clear().apply()
+        selectedDevice = null
+        closeGatt()
+        setState(AppState.WAIT_PAIR_BUTTON)
+        connectionView.text = "Saved device cleared. Hold PAIR 5s, then scan."
+        addLog("Saved device cleared")
+    }
+
+    private fun bondStateName(state: Int): String {
+        return when (state) {
+            BluetoothDevice.BOND_NONE -> "none"
+            BluetoothDevice.BOND_BONDING -> "bonding"
+            BluetoothDevice.BOND_BONDED -> "bonded"
+            else -> "unknown"
+        }
     }
 
     private fun hasPermissions(): Boolean {
-        return requiredPermissions.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
+        return requiredPermissions.all {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
     }
 }

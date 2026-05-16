@@ -155,8 +155,19 @@ android/JustinShuntTest
 
 It is a native Kotlin single-activity project. It requests Android 12+
 Bluetooth permissions, scans for `Justin_Shunt_Test`, calls `createBond()`,
-waits for `ACTION_BOND_STATE_CHANGED`, discovers the custom GATT service,
-subscribes to Live Data, and writes the encrypted LED Control characteristic.
+waits for `ACTION_BOND_STATE_CHANGED`, discovers the custom GATT service, and
+uses Android's standard one-operation-at-a-time GATT flow.
+
+The test screen shows:
+
+- BLE connection and pairing state
+- Live Data notifications from `12345678-1234-5678-1234-56789abcdef1`
+- Device Status notifications and reads from `12345678-1234-5678-1234-56789abcdef3`
+- P19 LED encrypted writes through `12345678-1234-5678-1234-56789abcdef2`
+- saved bonded-device reconnect and a local "Forget Saved Device" control
+
+Use Android Studio to open `android/JustinShuntTest`. A local Gradle/JDK install
+is required to build the APK from command line.
 
 ## Snapshots
 
