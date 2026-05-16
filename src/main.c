@@ -1,8 +1,15 @@
 /*
- * E73 nRF52840 BLE NUS recovery baseline.
+ * E73 nRF52840 BLE NUS + JSS official baseline firmware.
+ * FW version: 0.2.6-OFFICIAL-BASELINE
  *
- * This image intentionally starts with only LEDs + BLE advertising. Once this
- * advertises reliably, switches and ADC can be added back one at a time.
+ * Aligned with Nordic official peripheral_uart sample (sdk-nrf).
+ *
+ * Design principles:
+ *  - No custom notify pipeline; direct bt_gatt_notify at 1 Hz
+ *  - No manual bond rejection in GATT write; let stack enforce WRITE_ENCRYPT
+ *  - No fake bonded_count; use delayed bond refresh after pairing
+ *  - Status characteristic notifies after every update
+ *  - Advertising layout matches official: name in ad, UUID in sd
  */
 
 #include <errno.h>
@@ -13,6 +20,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/hci.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
@@ -37,8 +45,6 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define STATUS_REPORT_INTERVAL_SECONDS 3
 #define PAIR_MODE_WINDOW_SECONDS 60
 #define MAX_CONN CONFIG_BT_MAX_CONN
-#define LIVE_NOTIFICATION_RETRY_MS 200
-#define LIVE_NOTIFICATION_PIPELINE_SIZE CONFIG_BT_CONN_TX_MAX
 
 #define ADC_AIN1_CHANNEL 0
 #define ADC_AIN4_CHANNEL 1
@@ -78,14 +84,13 @@ static struct bt_conn *active_conns[MAX_CONN];
 static struct k_work_delayable activity_led_off_work;
 static struct k_work_delayable pair_mode_timeout_work;
 static struct k_work_delayable pair_mode_blink_work;
-static struct k_work_delayable live_notify_work;
+static struct k_work_delayable bond_refresh_work;
 static struct k_work adv_work;
 static atomic_t pair_short_press_count;
 static atomic_t pair_mode_request_count;
 static atomic_t clear_bonds_request_count;
 static atomic_t bonded_count;
 static atomic_t app_led_on;
-static atomic_t live_notify_pipeline = ATOMIC_INIT(LIVE_NOTIFICATION_PIPELINE_SIZE);
 static int cached_adc_init_err = -ENODEV;
 static int cached_button_init_err = -ENODEV;
 static int cached_ina228_init_err = -ENODEV;
@@ -96,19 +101,22 @@ static uint16_t ina228_device_id;
 
 K_SEM_DEFINE(start_ble_sem, 0, 1);
 
+/* Official layout: name in ad (visible during passive scan), UUID in sd. */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, JSS_SERVICE_UUID_VAL),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, JSS_SERVICE_UUID_VAL),
 };
 
 static void pair_mode_timeout_handler(struct k_work *work);
 static void pair_mode_blink_handler(struct k_work *work);
-static void live_notify_work_handler(struct k_work *work);
+static void bond_refresh_work_handler(struct k_work *work);
 static void advertising_start(void);
+
+/* ---------- LED helpers ---------- */
 
 static void led_set(const struct gpio_dt_spec *led, int value)
 {
@@ -140,6 +148,8 @@ static void activity_pulse(void)
 	(void)k_work_reschedule(&activity_led_off_work, K_MSEC(80));
 }
 
+/* ---------- NUS debug output ---------- */
+
 static void nus_send_text(const char *text)
 {
 	struct bt_conn *conn = NULL;
@@ -163,6 +173,8 @@ static void nus_send_text(const char *text)
 	activity_pulse();
 }
 
+/* ---------- Error handler ---------- */
+
 static void error_blink_forever(uint8_t code)
 {
 	for (;;) {
@@ -179,6 +191,8 @@ static void error_blink_forever(uint8_t code)
 		}
 	}
 }
+
+/* ---------- Peripheral init ---------- */
 
 static int leds_init(void)
 {
@@ -209,7 +223,7 @@ static int leds_init(void)
 	k_work_init_delayable(&activity_led_off_work, activity_led_off);
 	k_work_init_delayable(&pair_mode_timeout_work, pair_mode_timeout_handler);
 	k_work_init_delayable(&pair_mode_blink_work, pair_mode_blink_handler);
-	k_work_init_delayable(&live_notify_work, live_notify_work_handler);
+	k_work_init_delayable(&bond_refresh_work, bond_refresh_work_handler);
 	atomic_set(&leds_ready, 1);
 	k_sem_give(&start_ble_sem);
 
@@ -292,6 +306,8 @@ static int nrf_temp_read_x10(int32_t *temp_x10)
 	*temp_x10 = value.val1 * 10 + value.val2 / 100000;
 	return 0;
 }
+
+/* ---------- INA228 driver ---------- */
 
 struct ina228_sample {
 	int32_t bus_mv;
@@ -378,6 +394,7 @@ static int ina228_avg_bits(uint16_t avg_count, uint16_t *bits)
 		*bits = 7;
 		return 0;
 	default:
+		LOG_WRN("Unsupported INA228 avg_count %u", avg_count);
 		return -EINVAL;
 	}
 }
@@ -486,6 +503,8 @@ static int ina228_read_all(struct ina228_sample *sample)
 	return 0;
 }
 
+/* ---------- Bond management ---------- */
+
 static void count_bond(const struct bt_bond_info *info, void *user_data)
 {
 	uint32_t *count = user_data;
@@ -504,6 +523,20 @@ static uint32_t refresh_bonded_count(void)
 
 	return count;
 }
+
+static void update_jss_status(void);
+
+static void bond_refresh_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	refresh_bonded_count();
+	update_jss_status();
+	LOG_INF("Delayed bond refresh: bonded_count=%ld",
+		(long)atomic_get(&bonded_count));
+}
+
+/* ---------- Connection helpers ---------- */
 
 static uint16_t active_uatt_mtu(void)
 {
@@ -527,15 +560,19 @@ static bt_security_t active_security_level(void)
 	return BT_SECURITY_L0;
 }
 
-static struct bt_conn *first_active_conn(void)
+static bool active_link_is_bonded(void)
 {
+	/* Debug/status helper only. Do not use this to authorize writes;
+	 * BT_GATT_PERM_WRITE_ENCRYPT is the official baseline enforcement. */
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
-		if (active_conns[i]) {
-			return active_conns[i];
+		if (active_conns[i] &&
+		    bt_conn_get_security(active_conns[i]) >= BT_SECURITY_L2 &&
+		    atomic_get(&bonded_count) > 0) {
+			return true;
 		}
 	}
 
-	return NULL;
+	return false;
 }
 
 static struct bt_conn *first_live_subscribed_conn(void)
@@ -558,26 +595,6 @@ static bool any_live_subscribed_conn(void)
 static bool any_bond_exists(void)
 {
 	return refresh_bonded_count() > 0;
-}
-
-static bool peer_is_bonded(struct bt_conn *conn)
-{
-	/*
-	 * Keep this close to Zephyr's security model: the LED characteristic has
-	 * BT_GATT_PERM_WRITE_ENCRYPT, so the stack enforces encryption before the
-	 * write handler runs. Do not compare the active peer address with the bond
-	 * address here; Android may connect with a resolvable/private address while
-	 * Zephyr stores the identity address in the bond table.
-	 */
-	if (!conn) {
-		return false;
-	}
-
-	if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
-		return false;
-	}
-
-	return any_bond_exists();
 }
 
 static void remove_conn(struct bt_conn *conn)
@@ -605,19 +622,23 @@ static int store_conn(struct bt_conn *conn)
 	return -ENOMEM;
 }
 
+/* ---------- Status reporting ---------- */
+
 static void update_jss_status(void)
 {
 	char status[256];
-	struct bt_conn *conn = first_active_conn();
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.5,MTU=%u,SEC_LEVEL=%u,IS_BONDED=%d,LIVE_CCC=%d,LIVE_SUB=%d,STATUS_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu,LAST_WRITE_ERR=%d",
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.6-OFFICIAL-BASELINE,"
+		       "MTU=%u,SEC_LEVEL=%u,IS_BONDED=%d,LIVE_CCC=%d,LIVE_SUB=%d,"
+		       "STATUS_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu,"
+		       "LAST_WRITE_ERR=%d",
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
 		       (long)atomic_get(&app_led_on),
 		       active_uatt_mtu(),
 		       active_security_level(),
-		       conn ? (peer_is_bonded(conn) ? 1 : 0) : 0,
+		       active_link_is_bonded() ? 1 : 0,
 		       jss_service_live_notify_enabled() ? 1 : 0,
 		       any_live_subscribed_conn() ? 1 : 0,
 		       jss_service_status_notify_enabled() ? 1 : 0,
@@ -627,59 +648,11 @@ static void update_jss_status(void)
 		       (unsigned long)jss_service_live_notify_skips(),
 		       jss_service_led_write_last_err());
 	jss_service_set_status(status);
+	/* Notify status to subscribed peers immediately. */
+	jss_service_notify_status();
 }
 
-static void schedule_live_notify(k_timeout_t delay)
-{
-	if (!atomic_get(&ble_connected_count)) {
-		return;
-	}
-
-	(void)k_work_reschedule(&live_notify_work, delay);
-}
-
-static void live_notify_sent(void)
-{
-	atomic_inc(&live_notify_pipeline);
-}
-
-static void live_notify_state_changed(bool enabled)
-{
-	if (enabled) {
-		atomic_set(&live_notify_pipeline, LIVE_NOTIFICATION_PIPELINE_SIZE);
-		schedule_live_notify(K_NO_WAIT);
-	} else {
-		(void)k_work_cancel_delayable(&live_notify_work);
-		atomic_set(&live_notify_pipeline, LIVE_NOTIFICATION_PIPELINE_SIZE);
-	}
-}
-
-static void live_notify_work_handler(struct k_work *work)
-{
-	int err;
-	atomic_val_t pipeline;
-	struct bt_conn *conn;
-
-	if (!atomic_get(&ble_connected_count)) {
-		return;
-	}
-
-	pipeline = atomic_get(&live_notify_pipeline);
-	if (pipeline == 0) {
-		(void)k_work_reschedule(k_work_delayable_from_work(work),
-					 K_MSEC(LIVE_NOTIFICATION_RETRY_MS));
-		return;
-	}
-
-	conn = first_live_subscribed_conn();
-	err = jss_service_notify_live_data(conn);
-	if (err == 0) {
-		atomic_dec(&live_notify_pipeline);
-	} else if (err == -ENOMEM || err == -EAGAIN || err == -ENOTCONN) {
-		(void)k_work_reschedule(k_work_delayable_from_work(work),
-					 K_MSEC(LIVE_NOTIFICATION_RETRY_MS));
-	}
-}
+/* ---------- Pair mode ---------- */
 
 static void pair_mode_blink_handler(struct k_work *work)
 {
@@ -750,6 +723,8 @@ static void clear_all_bonds(void)
 	}
 }
 
+/* ---------- Advertising ---------- */
+
 static void adv_work_handler(struct k_work *work)
 {
 	int err;
@@ -758,6 +733,7 @@ static void adv_work_handler(struct k_work *work)
 
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err == -EALREADY) {
+		LOG_DBG("Advertising already active");
 		return;
 	}
 
@@ -774,17 +750,26 @@ static void advertising_start(void)
 	k_work_submit(&adv_work);
 }
 
+/* ---------- BLE connection callbacks ---------- */
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 	int sec_err;
 
 	if (err) {
+		LOG_ERR("Connection failed, err 0x%02x %s", err, bt_hci_err_to_str(err));
 		return;
 	}
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	(void)store_conn(conn);
+
+	if (store_conn(conn)) {
+		LOG_WRN("Connection pool full, disconnecting %s", addr);
+		bt_conn_disconnect(conn, BT_HCI_ERR_CONN_LIMIT_EXCEEDED);
+		return;
+	}
+
 	led_set(&conn_led, 1);
 	LOG_INF("Connected: %s", addr);
 
@@ -800,14 +785,15 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	ARG_UNUSED(reason);
+	char addr[BT_ADDR_LE_STR_LEN];
 
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	remove_conn(conn);
-	LOG_INF("Disconnected");
+	LOG_INF("Disconnected: %s, reason 0x%02x %s", addr, reason,
+		bt_hci_err_to_str(reason));
+
 	if (!atomic_get(&ble_connected_count)) {
 		led_set(&conn_led, 0);
-		(void)k_work_cancel_delayable(&live_notify_work);
-		atomic_set(&live_notify_pipeline, LIVE_NOTIFICATION_PIPELINE_SIZE);
 	}
 }
 
@@ -820,36 +806,49 @@ static void recycled_cb(void)
 static void security_changed(struct bt_conn *conn, bt_security_t level,
 			     enum bt_security_err err)
 {
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
 	if (!err) {
-		LOG_INF("Security changed: level %u", level);
+		LOG_INF("Security changed: %s level %u", addr, level);
 	} else {
-		LOG_WRN("Security failed: level %u err %d", level, err);
+		LOG_WRN("Security failed: %s level %u err %d %s", addr, level,
+			err, bt_security_err_to_str(err));
 	}
 }
 
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
-	ARG_UNUSED(conn);
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("Pairing completed: %s, bonded: %d", addr, bonded);
 
 	if (bonded) {
-		uint32_t count = refresh_bonded_count();
-
-		if (count == 0) {
-			atomic_set(&bonded_count, 1);
-		}
 		bt_set_bondable(false);
 		atomic_set(&pair_mode_active, 0);
 		(void)k_work_cancel_delayable(&pair_mode_timeout_work);
 		(void)k_work_cancel_delayable(&pair_mode_blink_work);
-		update_jss_status();
+		/*
+		 * Do not fake bonded_count here. The Zephyr settings subsystem
+		 * may not have persisted the bond yet, so bt_foreach_bond()
+		 * can return 0 immediately after pairing. Use a delayed work
+		 * item to refresh the count after settings have had time to
+		 * flush.
+		 */
+		(void)k_work_reschedule(&bond_refresh_work, K_MSEC(500));
 		nus_send_text("SECURITY,PAIRING_COMPLETE,bonded=1\r\n");
 	}
 }
 
 static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 {
-	ARG_UNUSED(conn);
-	ARG_UNUSED(reason);
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("Pairing failed: %s, reason %d %s", addr, reason,
+		bt_security_err_to_str(reason));
 
 	nus_send_text("SECURITY,PAIRING_FAILED\r\n");
 }
@@ -866,6 +865,8 @@ static struct bt_conn_auth_info_cb auth_info_cb = {
 	.pairing_failed = pairing_failed,
 };
 
+/* ---------- NUS receive ---------- */
+
 static void nus_received(struct bt_conn *conn, const uint8_t *const data, uint16_t len)
 {
 	if (len >= 4 && memcmp(data, "PING", 4) == 0 && conn) {
@@ -880,6 +881,8 @@ static void nus_received(struct bt_conn *conn, const uint8_t *const data, uint16
 static struct bt_nus_cb nus_cb = {
 	.received = nus_received,
 };
+
+/* ---------- Button events ---------- */
 
 static void button_event_handler(enum button_control_event event, void *user_data)
 {
@@ -913,13 +916,12 @@ static void button_event_handler(enum button_control_event event, void *user_dat
 	}
 }
 
+/* ---------- main ---------- */
+
 int main(void)
 {
 	static const struct jss_service_handlers jss_handlers = {
 		.led_write = app_led_set,
-		.conn_is_bonded = peer_is_bonded,
-		.live_notify_state = live_notify_state_changed,
-		.live_notify_sent = live_notify_sent,
 	};
 	int err = leds_init();
 	uint32_t seq = 0;
@@ -947,6 +949,7 @@ int main(void)
 		atomic_set(&nrf_temp_ready, 1);
 	}
 
+	/* adv_work must be initialised before bt_enable: recycled_cb may fire immediately. */
 	k_work_init(&adv_work, adv_work_handler);
 
 	err = bt_conn_auth_info_cb_register(&auth_info_cb);
@@ -958,6 +961,8 @@ int main(void)
 	if (err) {
 		error_blink_forever(2);
 	}
+
+	LOG_INF("Bluetooth initialized");
 
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		(void)settings_load();
@@ -1087,6 +1092,7 @@ int main(void)
 				nus_send_text(line);
 			}
 
+			/* Official baseline: direct notify, no pipeline. */
 			(void)snprintk(line, sizeof(line), "V=%ld.%03ld,I=%ld,T=%ld.%ld,SOC=88",
 				       (long)(live_vbus_mv / 1000),
 				       (long)(live_vbus_mv % 1000),
@@ -1094,7 +1100,15 @@ int main(void)
 				       (long)(live_temp_x10 / 10),
 				       (long)(live_temp_x10 % 10));
 			jss_service_set_live_data(line);
-			schedule_live_notify(K_NO_WAIT);
+
+			{
+				struct bt_conn *live_conn = first_live_subscribed_conn();
+
+				if (live_conn) {
+					(void)jss_service_notify_live_data(live_conn);
+				}
+			}
+
 			update_jss_status();
 		}
 

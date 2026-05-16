@@ -15,15 +15,11 @@
 #define JSS_SERVICE_UUID_VAL BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
 
 typedef void (*jss_led_write_handler_t)(bool led_on);
-typedef bool (*jss_conn_is_bonded_handler_t)(struct bt_conn *conn);
-typedef void (*jss_live_notify_state_handler_t)(bool enabled);
-typedef void (*jss_live_notify_sent_handler_t)(void);
 
 struct jss_service_handlers {
 	jss_led_write_handler_t led_write;
-	jss_conn_is_bonded_handler_t conn_is_bonded;
-	jss_live_notify_state_handler_t live_notify_state;
-	jss_live_notify_sent_handler_t live_notify_sent;
+	/* conn_is_bonded, live_notify_state, live_notify_sent removed.
+	 * Stack enforces WRITE_ENCRYPT; notify is direct at 1 Hz. */
 };
 
 void jss_service_init(const struct jss_service_handlers *handlers);

@@ -583,23 +583,31 @@ private class JustinBleManager(
     }
 
     override fun initialize() {
-        requestMtu(247)
-            .with { _, mtu -> appCallbacks.onBleLog("MTU changed: $mtu") }
-            .fail { _, status -> appCallbacks.onBleLog("MTU request failed: $status") }
-            .enqueue()
-
         setNotificationCallback(liveCharacteristic)
             .with { _, data -> appCallbacks.onLiveData(data.toUtf8()) }
-        enableNotifications(liveCharacteristic)
-            .done { appCallbacks.onBleLog("Live data notifications enabled") }
-            .fail { _, status -> appCallbacks.onBleError("Live notification enable failed: $status") }
-            .enqueue()
-
         setNotificationCallback(statusCharacteristic)
             .with { _, data -> appCallbacks.onStatus(data.toUtf8()) }
-        enableNotifications(statusCharacteristic)
-            .done { appCallbacks.onBleLog("Device status notifications enabled") }
-            .fail { _, status -> appCallbacks.onBleError("Status notification enable failed: $status") }
+
+        beginAtomicRequestQueue()
+            .add(
+                requestMtu(247)
+                    .with { _, mtu -> appCallbacks.onBleLog("MTU changed: $mtu") }
+                    .fail { _, status -> appCallbacks.onBleLog("MTU request failed: $status") }
+            )
+            .add(
+                enableNotifications(liveCharacteristic)
+                    .done { appCallbacks.onBleLog("Live data notifications enabled") }
+            )
+            .add(
+                enableNotifications(statusCharacteristic)
+                    .done { appCallbacks.onBleLog("Device status notifications enabled") }
+            )
+            .done {
+                appCallbacks.onBleLog("Device ready")
+                readStatus()
+                readLiveData()
+            }
+            .fail { _, status -> appCallbacks.onBleError("GATT init failed: $status") }
             .enqueue()
     }
 

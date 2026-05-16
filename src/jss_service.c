@@ -1,3 +1,11 @@
+/*
+ * Justin Smart Shunt Test GATT Service.
+ * Official baseline: direct bt_gatt_notify(), no pipeline.
+ *
+ * LED characteristic uses BT_GATT_PERM_WRITE_ENCRYPT.
+ * Encryption is enforced by the Zephyr stack; no manual bond check here.
+ */
+
 #include "jss_service.h"
 
 #include <errno.h>
@@ -27,8 +35,14 @@ static const struct bt_uuid_128 jss_device_status_uuid =
 					    0x56789abcdef3));
 
 static struct jss_service_handlers service_handlers;
+
+/* Mutex protection for shared text buffers written from main thread,
+ * read from BLE system workqueue thread (GATT read / notify). */
+static K_MUTEX_DEFINE(live_data_mutex);
+static K_MUTEX_DEFINE(status_mutex);
+
 static char live_data[JSS_TEXT_MAX_LEN] = "V=0.000,I=0,T=0,SOC=0";
-static char device_status[JSS_TEXT_MAX_LEN] = "PAIR_MODE=0,BONDED_COUNT=0,LED=0,FW=0.1.0";
+static char device_status[JSS_TEXT_MAX_LEN] = "PAIR_MODE=0,BONDED_COUNT=0,LED=0,FW=0.2.6-OFFICIAL-BASELINE,IS_BONDED=0";
 static bool led_on;
 static bool live_notify_enabled;
 static bool status_notify_enabled;
@@ -40,22 +54,35 @@ static uint32_t live_notify_skips;
 static int live_notify_last_err;
 static int led_write_last_err;
 
-static ssize_t read_text(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			 void *buf, uint16_t len, uint16_t offset)
-{
-	const char *value = attr->user_data;
+/* ---------- GATT read callbacks ---------- */
 
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, value, strlen(value));
+static ssize_t read_live_data(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			      void *buf, uint16_t len, uint16_t offset)
+{
+	ssize_t ret;
+
+	k_mutex_lock(&live_data_mutex, K_FOREVER);
+	ret = bt_gatt_attr_read(conn, attr, buf, len, offset,
+				live_data, strlen(live_data));
+	k_mutex_unlock(&live_data_mutex);
+
+	return ret;
 }
 
-static bool conn_is_bonded(struct bt_conn *conn)
+static ssize_t read_device_status(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				  void *buf, uint16_t len, uint16_t offset)
 {
-	if (!service_handlers.conn_is_bonded) {
-		return false;
-	}
+	ssize_t ret;
 
-	return service_handlers.conn_is_bonded(conn);
+	k_mutex_lock(&status_mutex, K_FOREVER);
+	ret = bt_gatt_attr_read(conn, attr, buf, len, offset,
+				device_status, strlen(device_status));
+	k_mutex_unlock(&status_mutex);
+
+	return ret;
 }
+
+/* ---------- LED write callback ---------- */
 
 static ssize_t write_led_control(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				 const void *buf, uint16_t len, uint16_t offset,
@@ -63,6 +90,7 @@ static ssize_t write_led_control(struct bt_conn *conn, const struct bt_gatt_attr
 {
 	const uint8_t *value = buf;
 
+	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
@@ -74,12 +102,6 @@ static ssize_t write_led_control(struct bt_conn *conn, const struct bt_gatt_attr
 	if (len != 1) {
 		led_write_last_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
-	}
-
-	if (!conn_is_bonded(conn)) {
-		LOG_WRN("Rejecting encrypted LED write from unbonded peer");
-		led_write_last_err = BT_ATT_ERR_AUTHORIZATION;
-		return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
 	}
 
 	if (value[0] != 0x00 && value[0] != 0x01) {
@@ -97,15 +119,14 @@ static ssize_t write_led_control(struct bt_conn *conn, const struct bt_gatt_attr
 	return len;
 }
 
+/* ---------- CCC callbacks ---------- */
+
 static void live_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	ARG_UNUSED(attr);
 
 	live_notify_enabled = value == BT_GATT_CCC_NOTIFY;
 	LOG_INF("Live data notify %s", live_notify_enabled ? "enabled" : "disabled");
-	if (service_handlers.live_notify_state) {
-		service_handlers.live_notify_state(live_notify_enabled);
-	}
 }
 
 static void status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
@@ -116,12 +137,14 @@ static void status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	LOG_INF("Status notify %s", status_notify_enabled ? "enabled" : "disabled");
 }
 
+/* ---------- GATT service definition ---------- */
+
 BT_GATT_SERVICE_DEFINE(jss_svc,
 	BT_GATT_PRIMARY_SERVICE(&jss_service_uuid),
 	BT_GATT_CHARACTERISTIC(&jss_live_data_uuid.uuid,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_READ,
-			       read_text, NULL, live_data),
+			       read_live_data, NULL, NULL),
 	BT_GATT_CCC(live_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 	BT_GATT_CHARACTERISTIC(&jss_led_control_uuid.uuid,
 			       BT_GATT_CHRC_WRITE,
@@ -130,9 +153,11 @@ BT_GATT_SERVICE_DEFINE(jss_svc,
 	BT_GATT_CHARACTERISTIC(&jss_device_status_uuid.uuid,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_READ,
-			       read_text, NULL, device_status),
+			       read_device_status, NULL, NULL),
 	BT_GATT_CCC(status_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
+
+/* ---------- Public API ---------- */
 
 void jss_service_init(const struct jss_service_handlers *handlers)
 {
@@ -140,8 +165,18 @@ void jss_service_init(const struct jss_service_handlers *handlers)
 		service_handlers = *handlers;
 	}
 
-	live_data_attr = &jss_svc.attrs[2];
-	device_status_attr = &jss_svc.attrs[7];
+	/* Runtime attribute lookup by UUID; no magic index dependency. */
+	live_data_attr = bt_gatt_find_by_uuid(jss_svc.attrs, jss_svc.attr_count,
+					      &jss_live_data_uuid.uuid);
+	device_status_attr = bt_gatt_find_by_uuid(jss_svc.attrs, jss_svc.attr_count,
+						  &jss_device_status_uuid.uuid);
+
+	if (!live_data_attr) {
+		LOG_ERR("Failed to find live data attribute by UUID");
+	}
+	if (!device_status_attr) {
+		LOG_ERR("Failed to find device status attribute by UUID");
+	}
 }
 
 void jss_service_set_live_data(const char *text)
@@ -150,7 +185,9 @@ void jss_service_set_live_data(const char *text)
 		return;
 	}
 
+	k_mutex_lock(&live_data_mutex, K_FOREVER);
 	(void)snprintk(live_data, sizeof(live_data), "%s", text);
+	k_mutex_unlock(&live_data_mutex);
 }
 
 void jss_service_set_status(const char *text)
@@ -159,7 +196,9 @@ void jss_service_set_status(const char *text)
 		return;
 	}
 
+	k_mutex_lock(&status_mutex, K_FOREVER);
 	(void)snprintk(device_status, sizeof(device_status), "%s", text);
+	k_mutex_unlock(&status_mutex);
 }
 
 int jss_service_notify_live_data(struct bt_conn *conn)
@@ -183,13 +222,14 @@ int jss_service_notify_live_data(struct bt_conn *conn)
 	}
 
 	live_notify_attempts++;
+
+	k_mutex_lock(&live_data_mutex, K_FOREVER);
 	err = bt_gatt_notify(conn, live_data_attr, live_data, strlen(live_data));
+	k_mutex_unlock(&live_data_mutex);
+
 	live_notify_last_err = err;
 	if (err == 0) {
 		live_notify_successes++;
-		if (service_handlers.live_notify_sent) {
-			service_handlers.live_notify_sent();
-		}
 	}
 	return err;
 }
@@ -204,7 +244,9 @@ void jss_service_notify_status(void)
 		return;
 	}
 
+	k_mutex_lock(&status_mutex, K_FOREVER);
 	(void)bt_gatt_notify(NULL, device_status_attr, device_status, strlen(device_status));
+	k_mutex_unlock(&status_mutex);
 }
 
 bool jss_service_led_on(void)
