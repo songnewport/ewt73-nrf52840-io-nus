@@ -165,7 +165,7 @@ class MainActivity : Activity() {
 
                 BluetoothDevice.BOND_NONE -> {
                     bondInProgress = false
-                    showError("Pairing failed or cancelled. Hold PAIR 5s and try again.")
+                    clearStaleBond(device)
                 }
             }
         }
@@ -179,6 +179,10 @@ class MainActivity : Activity() {
                 val device = selectedDevice
                 closeGatt()
                 setState(AppState.DISCONNECTED)
+                if (device != null && isLikelyStaleBondError(status)) {
+                    clearStaleBond(device)
+                    return
+                }
                 if (status == 133 && device != null && gattRetryCount == 0) {
                     gattRetryCount++
                     addLog("Retrying GATT once after 133")
@@ -834,6 +838,23 @@ class MainActivity : Activity() {
         setState(AppState.WAIT_PAIR_BUTTON)
         connectionView.text = "Saved device cleared. Hold PAIR 5s, then scan."
         addLog("Saved device cleared")
+    }
+
+    private fun isLikelyStaleBondError(status: Int): Boolean {
+        return status == 5 || status == 8 || status == 22 || status == 133
+    }
+
+    private fun clearStaleBond(device: BluetoothDevice) {
+        if (removeBond(device)) {
+            addLog("Stale Android bond removed: ${device.address}")
+        } else {
+            addLog("Stale Android bond clear requested: ${device.address}")
+        }
+        prefs.edit().clear().apply()
+        selectedDevice = null
+        connectSession++
+        setState(AppState.WAIT_PAIR_BUTTON)
+        connectionView.text = "Bond reset. Hold PAIR 5s, then scan/connect again."
     }
 
     @SuppressLint("MissingPermission")
