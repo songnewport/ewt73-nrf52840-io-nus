@@ -130,10 +130,8 @@ void jss_service_init(const struct jss_service_handlers *handlers)
 		service_handlers = *handlers;
 	}
 
-	live_data_attr = bt_gatt_find_by_uuid(jss_svc.attrs, jss_svc.attr_count,
-					      &jss_live_data_uuid.uuid);
-	device_status_attr = bt_gatt_find_by_uuid(jss_svc.attrs, jss_svc.attr_count,
-						  &jss_device_status_uuid.uuid);
+	live_data_attr = &jss_svc.attrs[2];
+	device_status_attr = &jss_svc.attrs[7];
 }
 
 void jss_service_set_live_data(const char *text)
