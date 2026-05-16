@@ -93,6 +93,7 @@ class MainActivity : Activity() {
     private lateinit var ledButton: Button
     private lateinit var readStatusButton: Button
     private lateinit var forgetButton: Button
+    private lateinit var clearLogButton: Button
 
     private val requiredPermissions: Array<String>
         get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -411,12 +412,17 @@ class MainActivity : Activity() {
             text = "Forget Saved Device"
             setOnClickListener { forgetSavedDevice() }
         }
+        clearLogButton = Button(this).apply {
+            text = "Clear Log"
+            setOnClickListener { clearLog() }
+        }
 
         root.addView(titleView)
         root.addView(stateView)
         root.addView(connectionView)
         root.addView(buttonRow(scanButton, ledButton))
         root.addView(buttonRow(readStatusButton, forgetButton))
+        root.addView(clearLogButton)
         root.addView(sectionLabel("Live Data"))
         root.addView(liveView)
         root.addView(sectionLabel("Device Status"))
@@ -755,6 +761,12 @@ class MainActivity : Activity() {
     private fun addLog(message: String) {
         mainHandler.post {
             logView.append("${timeFormat.format(Date())}  $message\n")
+        }
+    }
+
+    private fun clearLog() {
+        mainHandler.post {
+            logView.text = ""
         }
     }
 
