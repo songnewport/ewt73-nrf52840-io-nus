@@ -593,12 +593,25 @@ static void pair_mode_timeout_handler(struct k_work *work)
 
 static void enter_pair_mode(void)
 {
+	int sec_err;
+
 	bt_set_bondable(true);
 	atomic_set(&pair_mode_active, 1);
 	(void)k_work_reschedule(&pair_mode_timeout_work, K_SECONDS(PAIR_MODE_WINDOW_SECONDS));
 	(void)k_work_reschedule(&pair_mode_blink_work, K_NO_WAIT);
 	update_jss_status();
 	nus_send_text("SECURITY,PAIR_MODE_ON,timeout=60\r\n");
+
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (!active_conns[i]) {
+			continue;
+		}
+
+		sec_err = bt_conn_set_security(active_conns[i], BT_SECURITY_L2);
+		if (sec_err) {
+			LOG_WRN("Pair-mode security request failed: %d", sec_err);
+		}
+	}
 }
 
 static void clear_all_bonds(void)
@@ -635,11 +648,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	led_set(&conn_led, 1);
 	LOG_INF("Connected: %s", addr);
 
-	sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
-	if (sec_err) {
-		LOG_WRN("Security request failed: %d", sec_err);
-	} else {
-		LOG_INF("Security requested");
+	if (peer_is_bonded(conn) || atomic_get(&pair_mode_active)) {
+		sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
+		if (sec_err) {
+			LOG_WRN("Security request failed: %d", sec_err);
+		} else {
+			LOG_INF("Security requested");
+		}
 	}
 }
 
@@ -781,12 +796,16 @@ int main(void)
 		atomic_set(&nrf_temp_ready, 1);
 	}
 
+	err = bt_conn_auth_info_cb_register(&auth_info_cb);
+	if (err) {
+		error_blink_forever(5);
+	}
+
 	err = bt_enable(NULL);
 	if (err) {
 		error_blink_forever(2);
 	}
 
-	(void)bt_conn_auth_info_cb_register(&auth_info_cb);
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		(void)settings_load();
 	}
