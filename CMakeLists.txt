@@ -6,4 +6,5 @@ project(ewt73_nrf52840_io_nus)
 target_sources(app PRIVATE
 	src/main.c
 	src/button_control.c
+	src/jss_service.c
 )

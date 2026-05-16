@@ -19,16 +19,23 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/sys/atomic.h>
 
 #include <bluetooth/services/nus.h>
 #include <soc.h>
 
 #include "button_control.h"
+#include "jss_service.h"
+
+LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 #define STATUS_REPORT_INTERVAL_SECONDS 3
+#define PAIR_MODE_WINDOW_SECONDS 60
+#define MAX_CONN CONFIG_BT_MAX_CONN
 
 #define ADC_AIN1_CHANNEL 0
 #define ADC_AIN4_CHANNEL 1
@@ -62,12 +69,17 @@ static atomic_t leds_ready;
 static atomic_t adc_ready;
 static atomic_t ina228_ready;
 static atomic_t nrf_temp_ready;
-static atomic_t ble_connected;
-static struct bt_conn *current_conn;
+static atomic_t ble_connected_count;
+static atomic_t pair_mode_active;
+static struct bt_conn *active_conns[MAX_CONN];
 static struct k_work_delayable activity_led_off_work;
+static struct k_work_delayable pair_mode_timeout_work;
+static struct k_work_delayable pair_mode_blink_work;
 static atomic_t pair_short_press_count;
 static atomic_t pair_mode_request_count;
 static atomic_t clear_bonds_request_count;
+static atomic_t bonded_count;
+static atomic_t app_led_on;
 static int cached_adc_init_err = -ENODEV;
 static int cached_button_init_err = -ENODEV;
 static int cached_ina228_init_err = -ENODEV;
@@ -80,6 +92,7 @@ K_SEM_DEFINE(start_ble_sem, 0, 1);
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, JSS_SERVICE_UUID_VAL),
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
@@ -87,31 +100,59 @@ static const struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 };
 
+static void pair_mode_timeout_handler(struct k_work *work);
+static void pair_mode_blink_handler(struct k_work *work);
+
 static void led_set(const struct gpio_dt_spec *led, int value)
 {
 	(void)gpio_pin_set_dt(led, value);
+}
+
+static void app_led_set(bool on)
+{
+	atomic_set(&app_led_on, on ? 1 : 0);
+	led_set(&activity_led, on ? 1 : 0);
 }
 
 static void activity_led_off(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	led_set(&activity_led, 0);
+	if (!atomic_get(&app_led_on)) {
+		led_set(&activity_led, 0);
+	}
 }
 
 static void activity_pulse(void)
 {
+	if (atomic_get(&app_led_on)) {
+		return;
+	}
+
 	led_set(&activity_led, 1);
 	(void)k_work_reschedule(&activity_led_off_work, K_MSEC(80));
 }
 
 static void nus_send_text(const char *text)
 {
-	if (!atomic_get(&ble_connected) || !current_conn) {
+	struct bt_conn *conn = NULL;
+
+	if (!atomic_get(&ble_connected_count)) {
 		return;
 	}
 
-	(void)bt_nus_send(current_conn, text, strlen(text));
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (active_conns[i]) {
+			conn = active_conns[i];
+			break;
+		}
+	}
+
+	if (!conn) {
+		return;
+	}
+
+	(void)bt_nus_send(conn, text, strlen(text));
 	activity_pulse();
 }
 
@@ -159,6 +200,8 @@ static int leds_init(void)
 	}
 
 	k_work_init_delayable(&activity_led_off_work, activity_led_off);
+	k_work_init_delayable(&pair_mode_timeout_work, pair_mode_timeout_handler);
+	k_work_init_delayable(&pair_mode_blink_work, pair_mode_blink_handler);
 	atomic_set(&leds_ready, 1);
 	k_sem_give(&start_ble_sem);
 
@@ -435,44 +478,228 @@ static int ina228_read_all(struct ina228_sample *sample)
 	return 0;
 }
 
+static void count_bond(const struct bt_bond_info *info, void *user_data)
+{
+	uint32_t *count = user_data;
+
+	ARG_UNUSED(info);
+
+	(*count)++;
+}
+
+static uint32_t refresh_bonded_count(void)
+{
+	uint32_t count = 0;
+
+	bt_foreach_bond(BT_ID_DEFAULT, count_bond, &count);
+	atomic_set(&bonded_count, count);
+
+	return count;
+}
+
+struct bond_match_context {
+	const bt_addr_le_t *addr;
+	bool found;
+};
+
+static void match_bond(const struct bt_bond_info *info, void *user_data)
+{
+	struct bond_match_context *ctx = user_data;
+
+	if (bt_addr_le_cmp(&info->addr, ctx->addr) == 0) {
+		ctx->found = true;
+	}
+}
+
+static bool peer_is_bonded(struct bt_conn *conn)
+{
+	struct bond_match_context ctx = {
+		.addr = bt_conn_get_dst(conn),
+		.found = false,
+	};
+
+	bt_foreach_bond(BT_ID_DEFAULT, match_bond, &ctx);
+	return ctx.found;
+}
+
+static void remove_conn(struct bt_conn *conn)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (active_conns[i] == conn) {
+			bt_conn_unref(active_conns[i]);
+			active_conns[i] = NULL;
+			atomic_dec(&ble_connected_count);
+			return;
+		}
+	}
+}
+
+static int store_conn(struct bt_conn *conn)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (!active_conns[i]) {
+			active_conns[i] = bt_conn_ref(conn);
+			atomic_inc(&ble_connected_count);
+			return 0;
+		}
+	}
+
+	return -ENOMEM;
+}
+
+static void update_jss_status(void)
+{
+	char status[96];
+
+	(void)snprintk(status, sizeof(status), "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.0",
+		       atomic_get(&pair_mode_active) ? 1 : 0,
+		       (long)atomic_get(&bonded_count),
+		       (long)atomic_get(&app_led_on));
+	jss_service_set_status(status);
+	jss_service_notify_status();
+}
+
+static void pair_mode_blink_handler(struct k_work *work)
+{
+	static bool on;
+
+	ARG_UNUSED(work);
+
+	if (!atomic_get(&pair_mode_active)) {
+		led_set(&heartbeat_led, 0);
+		return;
+	}
+
+	on = !on;
+	led_set(&heartbeat_led, on ? 1 : 0);
+	(void)k_work_reschedule(&pair_mode_blink_work, K_MSEC(150));
+}
+
+static void pair_mode_timeout_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	bt_set_bondable(false);
+	atomic_set(&pair_mode_active, 0);
+	update_jss_status();
+	nus_send_text("SECURITY,PAIR_MODE_TIMEOUT\r\n");
+}
+
+static void enter_pair_mode(void)
+{
+	bt_set_bondable(true);
+	atomic_set(&pair_mode_active, 1);
+	(void)k_work_reschedule(&pair_mode_timeout_work, K_SECONDS(PAIR_MODE_WINDOW_SECONDS));
+	(void)k_work_reschedule(&pair_mode_blink_work, K_NO_WAIT);
+	update_jss_status();
+	nus_send_text("SECURITY,PAIR_MODE_ON,timeout=60\r\n");
+}
+
+static void clear_all_bonds(void)
+{
+	int err;
+
+	bt_set_bondable(false);
+	atomic_set(&pair_mode_active, 0);
+	(void)k_work_cancel_delayable(&pair_mode_timeout_work);
+	(void)k_work_cancel_delayable(&pair_mode_blink_work);
+
+	err = bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+	refresh_bonded_count();
+	update_jss_status();
+
+	if (err) {
+		nus_send_text("SECURITY,CLEAR_BONDS_FAILED\r\n");
+	} else {
+		nus_send_text("SECURITY,CLEAR_BONDS_OK\r\n");
+	}
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
+	char addr[BT_ADDR_LE_STR_LEN];
+	int sec_err;
+
 	if (err) {
 		return;
 	}
 
-	current_conn = bt_conn_ref(conn);
-	atomic_set(&ble_connected, 1);
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	(void)store_conn(conn);
 	led_set(&conn_led, 1);
+	LOG_INF("Connected: %s", addr);
+
+	if (peer_is_bonded(conn) || atomic_get(&pair_mode_active)) {
+		sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
+		if (sec_err) {
+			LOG_WRN("Security request failed: %d", sec_err);
+		} else {
+			LOG_INF("Security requested");
+		}
+	}
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	ARG_UNUSED(reason);
+
+	remove_conn(conn);
+	LOG_INF("Disconnected");
+	if (!atomic_get(&ble_connected_count)) {
+		led_set(&conn_led, 0);
+	}
+}
+
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+			     enum bt_security_err err)
+{
+	if (!err) {
+		LOG_INF("Security changed: level %u", level);
+	} else {
+		LOG_WRN("Security failed: level %u err %d", level, err);
+	}
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	ARG_UNUSED(conn);
+
+	if (bonded) {
+		refresh_bonded_count();
+		bt_set_bondable(false);
+		atomic_set(&pair_mode_active, 0);
+		(void)k_work_cancel_delayable(&pair_mode_timeout_work);
+		(void)k_work_cancel_delayable(&pair_mode_blink_work);
+		update_jss_status();
+		nus_send_text("SECURITY,PAIRING_COMPLETE,bonded=1\r\n");
+	}
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
 	ARG_UNUSED(conn);
 	ARG_UNUSED(reason);
 
-	if (current_conn) {
-		bt_conn_unref(current_conn);
-		current_conn = NULL;
-	}
-
-	atomic_set(&ble_connected, 0);
-	led_set(&conn_led, 0);
+	nus_send_text("SECURITY,PAIRING_FAILED\r\n");
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.security_changed = security_changed,
+};
+
+static struct bt_conn_auth_info_cb auth_info_cb = {
+	.pairing_complete = pairing_complete,
+	.pairing_failed = pairing_failed,
 };
 
 static void nus_received(struct bt_conn *conn, const uint8_t *const data, uint16_t len)
 {
-	ARG_UNUSED(conn);
-
-	if (len >= 4 && memcmp(data, "PING", 4) == 0 && current_conn) {
+	if (len >= 4 && memcmp(data, "PING", 4) == 0 && conn) {
 		static const char pong[] = "PONG\r\n";
 
-		(void)bt_nus_send(current_conn, pong, sizeof(pong) - 1);
+		(void)bt_nus_send(conn, pong, sizeof(pong) - 1);
 	}
 
 	activity_pulse();
@@ -500,12 +727,14 @@ static void button_event_handler(enum button_control_event event, void *user_dat
 		snprintk(line, sizeof(line), "BUTTON,ENTER_PAIR_MODE,count=%ld\r\n",
 			 (long)atomic_get(&pair_mode_request_count));
 		nus_send_text(line);
+		enter_pair_mode();
 		break;
 	case BUTTON_CONTROL_EVENT_CLEAR_BONDS_REQUESTED:
 		atomic_inc(&clear_bonds_request_count);
 		snprintk(line, sizeof(line), "BUTTON,CLEAR_BONDS_REQUESTED,count=%ld\r\n",
 			 (long)atomic_get(&clear_bonds_request_count));
 		nus_send_text(line);
+		clear_all_bonds();
 		break;
 	default:
 		break;
@@ -514,6 +743,10 @@ static void button_event_handler(enum button_control_event event, void *user_dat
 
 int main(void)
 {
+	static const struct jss_service_handlers jss_handlers = {
+		.led_write = app_led_set,
+		.conn_is_bonded = peer_is_bonded,
+	};
 	int err = leds_init();
 	uint32_t seq = 0;
 
@@ -522,6 +755,7 @@ int main(void)
 	}
 
 	cached_button_init_err = button_control_init(button_event_handler, NULL);
+	jss_service_init(&jss_handlers);
 	cached_adc_init_err = adc_inputs_init();
 	if (!cached_adc_init_err) {
 		atomic_set(&adc_ready, 1);
@@ -544,6 +778,14 @@ int main(void)
 		error_blink_forever(2);
 	}
 
+	(void)bt_conn_auth_info_cb_register(&auth_info_cb);
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		(void)settings_load();
+	}
+	refresh_bonded_count();
+	bt_set_bondable(false);
+	update_jss_status();
+
 	err = bt_nus_init(&nus_cb);
 	if (err) {
 		error_blink_forever(3);
@@ -555,14 +797,21 @@ int main(void)
 	}
 
 	for (;;) {
-		led_set(&heartbeat_led, (++seq) % 2);
+		if (!atomic_get(&pair_mode_active)) {
+			led_set(&heartbeat_led, (++seq) % 2);
+		} else {
+			seq++;
+		}
 
-		if (atomic_get(&ble_connected) && current_conn &&
-		    (seq % STATUS_REPORT_INTERVAL_SECONDS) == 0) {
+		if (atomic_get(&ble_connected_count)) {
+			bool send_debug = (seq % STATUS_REPORT_INTERVAL_SECONDS) == 0;
 			uint16_t ain1_raw = 0;
 			uint16_t ain4_raw = 0;
 			int32_t ain1_mv = 0;
 			int32_t ain4_mv = 0;
+			int32_t live_vbus_mv = 0;
+			int32_t live_current_ma = 0;
+			int32_t live_temp_x10 = 0;
 			int ain1_err = cached_adc_init_err;
 			int ain4_err = cached_adc_init_err;
 			int32_t nrf_temp_x10 = 0;
@@ -578,6 +827,8 @@ int main(void)
 				ain4_err = zephyr_read_adc_mv(ADC_AIN4_CHANNEL, &ain4_mv, &ain4_raw);
 			}
 			nrf_temp_err = nrf_temp_read_x10(&nrf_temp_x10);
+			live_vbus_mv = ain1_mv;
+			live_temp_x10 = nrf_temp_err ? 0 : nrf_temp_x10;
 
 			if (ain1_err || ain4_err) {
 				len = snprintk(line, sizeof(line),
@@ -599,9 +850,8 @@ int main(void)
 					       (long)atomic_get(&clear_bonds_request_count));
 			}
 
-			if (len > 0) {
-				(void)bt_nus_send(current_conn, line, MIN(len, (int)sizeof(line) - 1));
-				activity_pulse();
+			if (send_debug && len > 0) {
+				nus_send_text(line);
 			}
 
 			if (atomic_get(&ina228_ready)) {
@@ -636,6 +886,9 @@ int main(void)
 							       (long)sample.temp_x10,
 							       (long)nrf_temp_x10);
 					}
+					live_vbus_mv = sample.bus_mv;
+					live_current_ma = sample.current_ma;
+					live_temp_x10 = sample.temp_x10;
 				}
 			} else {
 				if (nrf_temp_err) {
@@ -653,10 +906,19 @@ int main(void)
 				}
 			}
 
-			if (len > 0) {
-				(void)bt_nus_send(current_conn, line, MIN(len, (int)sizeof(line) - 1));
-				activity_pulse();
+			if (send_debug && len > 0) {
+				nus_send_text(line);
 			}
+
+			(void)snprintk(line, sizeof(line), "V=%ld.%03ld,I=%ld,T=%ld.%ld,SOC=88",
+				       (long)(live_vbus_mv / 1000),
+				       (long)(live_vbus_mv % 1000),
+				       (long)live_current_ma,
+				       (long)(live_temp_x10 / 10),
+				       (long)(live_temp_x10 % 10));
+			jss_service_set_live_data(line);
+			jss_service_notify_live_data();
+			update_jss_status();
 		}
 
 		k_sleep(K_SECONDS(1));

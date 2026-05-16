@@ -2,10 +2,10 @@
 
 Bring-up firmware for the EBYTE E73 / EWT73 nRF52840 test board.
 
-BLE device name: `E73_IO_NUS`
+BLE device name: `Justin_Shunt_Test`
 
-This project advertises Nordic UART Service and sends test data every 3 seconds
-after a phone or PC connects and subscribes to NUS TX.
+This project advertises Nordic UART Service for debug and a custom Justin Smart
+Shunt Test GATT service for product-flow security testing.
 
 Known-good result on 2026-05-15:
 
@@ -35,6 +35,33 @@ events over BLE NUS.
 - SAADC readings on AIN1 and AIN4
 - INA228 over I2C
 - nRF52840 internal die temperature
+- Custom Justin Smart Shunt Test GATT service
+- Bonding/encrypted LED control characteristic
+- 60-second physical PAIR button bonding window
+- Bond clearing with the 10-second PAIR button event
+
+## Stage 2 Custom GATT
+
+UUIDs used by both firmware and the Android test app:
+
+```text
+Service:       12345678-1234-5678-1234-56789abcdef0
+Live Data:     12345678-1234-5678-1234-56789abcdef1  READ/NOTIFY
+LED Control:   12345678-1234-5678-1234-56789abcdef2  WRITE encrypted
+Device Status: 12345678-1234-5678-1234-56789abcdef3  READ/NOTIFY
+```
+
+Security flow:
+
+```text
+Boot:       bt_set_bondable(false)
+5s PAIR:   bt_set_bondable(true), 60-second pairing window
+10s PAIR:  bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY), then non-bondable mode
+```
+
+The LED control characteristic uses `BT_GATT_PERM_WRITE_ENCRYPT`. The firmware
+also checks that the encrypted peer is bonded before accepting `0x00` or `0x01`.
+NUS remains enabled only for debug logs and terminal testing.
 
 ## Pins
 
@@ -84,15 +111,35 @@ Temperature fields use x10 Celsius:
 ## Build
 
 ```powershell
-& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\nrfutil.exe" toolchain-manager launch --ncs-version v3.3.0 -- west build -b nrf52840dk/nrf52840 . -d C:\ncs\build_ewt73_io_nus --pristine
+& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\nrfutil.exe" toolchain-manager launch --ncs-version v3.3.0 -- west build --no-sysbuild -b nrf52840dk/nrf52840 . -d C:\ncs\build_ewt73_io_nus --pristine
+```
+
+If a fresh NCS install is missing BLE security crypto modules, run:
+
+```powershell
+& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\nrfutil.exe" toolchain-manager launch --ncs-version v3.3.0 -- west update mbedtls
+& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\nrfutil.exe" toolchain-manager launch --ncs-version v3.3.0 -- west update oberon-psa-crypto
 ```
 
 ## Flash
 
 ```powershell
-& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\nrfutil.exe" device program --serial-number 69405231 --family nrf52 --swd-clock-frequency 1000 --firmware C:\ncs\build_ewt73_io_nus\merged.hex --options chip_erase_mode=ERASE_ALL,verify=VERIFY_READ,reset=RESET_HARD --log-level info
+& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\nrfutil.exe" device program --serial-number 69405231 --family nrf52 --swd-clock-frequency 1000 --firmware C:\ncs\build_ewt73_io_nus\zephyr\zephyr.hex --options chip_erase_mode=ERASE_ALL,verify=VERIFY_READ,reset=RESET_HARD --log-level info
 & "$env:LOCALAPPDATA\Microsoft\WinGet\Links\nrfutil.exe" device reset --serial-number 69405231
 ```
+
+## Android Test App
+
+The Stage 2 Android proof-of-concept app is under:
+
+```text
+android/JustinShuntTest
+```
+
+It is a native Kotlin single-activity project. It requests Android 12+
+Bluetooth permissions, scans for `Justin_Shunt_Test`, calls `createBond()`,
+waits for `ACTION_BOND_STATE_CHANGED`, discovers the custom GATT service,
+subscribes to Live Data, and writes the encrypted LED Control characteristic.
 
 ## Snapshots
 
