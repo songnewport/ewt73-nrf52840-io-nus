@@ -15,6 +15,17 @@ INA228 temp_x10 = 216
 nRF52840 nrf_temp_x10 = 220
 ```
 
+Stage 1 button refactor verified on 2026-05-16:
+
+```text
+BUTTON,PAIR_SHORT,count=...
+BUTTON,ENTER_PAIR_MODE,count=...
+BUTTON,CLEAR_BONDS_REQUESTED,count=...
+```
+
+The user confirmed short press, 5-second long press, and 10-second long press
+events over BLE NUS.
+
 ## Features
 
 - BLE Nordic UART Service peripheral
