@@ -92,11 +92,12 @@ K_SEM_DEFINE(start_ble_sem, 0, 1);
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, JSS_SERVICE_UUID_VAL),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, JSS_SERVICE_UUID_VAL),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 };
 
 static void pair_mode_timeout_handler(struct k_work *work);
