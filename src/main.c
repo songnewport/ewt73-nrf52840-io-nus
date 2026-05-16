@@ -516,6 +516,28 @@ static uint16_t active_uatt_mtu(void)
 	return 0;
 }
 
+static bt_security_t active_security_level(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (active_conns[i]) {
+			return bt_conn_get_security(active_conns[i]);
+		}
+	}
+
+	return BT_SECURITY_L0;
+}
+
+static struct bt_conn *first_active_conn(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (active_conns[i]) {
+			return active_conns[i];
+		}
+	}
+
+	return NULL;
+}
+
 static struct bt_conn *first_live_subscribed_conn(void)
 {
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
@@ -580,20 +602,25 @@ static int store_conn(struct bt_conn *conn)
 
 static void update_jss_status(void)
 {
-	char status[160];
+	char status[256];
+	struct bt_conn *conn = first_active_conn();
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.3,MTU=%u,LIVE_CCC=%d,LIVE_SUB=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu",
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.4,MTU=%u,SEC_LEVEL=%u,IS_BONDED=%d,LIVE_CCC=%d,LIVE_SUB=%d,STATUS_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu,LAST_WRITE_ERR=%d",
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
 		       (long)atomic_get(&app_led_on),
 		       active_uatt_mtu(),
+		       active_security_level(),
+		       conn ? (peer_is_bonded(conn) ? 1 : 0) : 0,
 		       jss_service_live_notify_enabled() ? 1 : 0,
 		       any_live_subscribed_conn() ? 1 : 0,
+		       jss_service_status_notify_enabled() ? 1 : 0,
 		       (unsigned long)jss_service_live_notify_successes(),
 		       (unsigned long)jss_service_live_notify_attempts(),
 		       jss_service_live_notify_last_err(),
-		       (unsigned long)jss_service_live_notify_skips());
+		       (unsigned long)jss_service_live_notify_skips(),
+		       jss_service_led_write_last_err());
 	jss_service_set_status(status);
 }
 

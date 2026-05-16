@@ -33,10 +33,12 @@ int jss_service_notify_live_data(struct bt_conn *conn);
 void jss_service_notify_status(void);
 bool jss_service_led_on(void);
 bool jss_service_live_notify_enabled(void);
+bool jss_service_status_notify_enabled(void);
 bool jss_service_live_is_subscribed(struct bt_conn *conn);
 uint32_t jss_service_live_notify_attempts(void);
 uint32_t jss_service_live_notify_successes(void);
 int jss_service_live_notify_last_err(void);
 uint32_t jss_service_live_notify_skips(void);
+int jss_service_led_write_last_err(void);
 
 #endif /* JSS_SERVICE_H_ */

@@ -12,7 +12,7 @@
 
 LOG_MODULE_REGISTER(jss_service, LOG_LEVEL_INF);
 
-#define JSS_TEXT_MAX_LEN 160
+#define JSS_TEXT_MAX_LEN 256
 
 static const struct bt_uuid_128 jss_service_uuid =
 	BT_UUID_INIT_128(JSS_SERVICE_UUID_VAL);
@@ -38,6 +38,7 @@ static uint32_t live_notify_attempts;
 static uint32_t live_notify_successes;
 static uint32_t live_notify_skips;
 static int live_notify_last_err;
+static int led_write_last_err;
 
 static ssize_t read_text(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			 void *buf, uint16_t len, uint16_t offset)
@@ -66,19 +67,23 @@ static ssize_t write_led_control(struct bt_conn *conn, const struct bt_gatt_attr
 	ARG_UNUSED(flags);
 
 	if (offset != 0) {
+		led_write_last_err = BT_ATT_ERR_INVALID_OFFSET;
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
 	if (len != 1) {
+		led_write_last_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
 	if (!conn_is_bonded(conn)) {
 		LOG_WRN("Rejecting encrypted LED write from unbonded peer");
+		led_write_last_err = BT_ATT_ERR_AUTHORIZATION;
 		return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
 	}
 
 	if (value[0] != 0x00 && value[0] != 0x01) {
+		led_write_last_err = BT_ATT_ERR_VALUE_NOT_ALLOWED;
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
@@ -88,6 +93,7 @@ static ssize_t write_led_control(struct bt_conn *conn, const struct bt_gatt_attr
 	}
 
 	LOG_INF("LED control accepted: %u", led_on ? 1 : 0);
+	led_write_last_err = 0;
 	return len;
 }
 
@@ -156,21 +162,9 @@ void jss_service_set_status(const char *text)
 	(void)snprintk(device_status, sizeof(device_status), "%s", text);
 }
 
-static void live_notify_complete(struct bt_conn *conn, void *user_data)
-{
-	ARG_UNUSED(conn);
-	ARG_UNUSED(user_data);
-
-	live_notify_successes++;
-	if (service_handlers.live_notify_sent) {
-		service_handlers.live_notify_sent();
-	}
-}
-
 int jss_service_notify_live_data(struct bt_conn *conn)
 {
 	int err;
-	struct bt_gatt_notify_params params;
 
 	if (!conn) {
 		live_notify_last_err = -ENOTCONN;
@@ -188,15 +182,15 @@ int jss_service_notify_live_data(struct bt_conn *conn)
 		return -EACCES;
 	}
 
-	memset(&params, 0, sizeof(params));
-	params.attr = live_data_attr;
-	params.data = live_data;
-	params.len = strlen(live_data);
-	params.func = live_notify_complete;
-
 	live_notify_attempts++;
-	err = bt_gatt_notify_cb(conn, &params);
+	err = bt_gatt_notify(conn, live_data_attr, live_data, strlen(live_data));
 	live_notify_last_err = err;
+	if (err == 0) {
+		live_notify_successes++;
+		if (service_handlers.live_notify_sent) {
+			service_handlers.live_notify_sent();
+		}
+	}
 	return err;
 }
 
@@ -221,6 +215,11 @@ bool jss_service_led_on(void)
 bool jss_service_live_notify_enabled(void)
 {
 	return live_notify_enabled;
+}
+
+bool jss_service_status_notify_enabled(void)
+{
+	return status_notify_enabled;
 }
 
 bool jss_service_live_is_subscribed(struct bt_conn *conn)
@@ -250,4 +249,9 @@ int jss_service_live_notify_last_err(void)
 uint32_t jss_service_live_notify_skips(void)
 {
 	return live_notify_skips;
+}
+
+int jss_service_led_write_last_err(void)
+{
+	return led_write_last_err;
 }
