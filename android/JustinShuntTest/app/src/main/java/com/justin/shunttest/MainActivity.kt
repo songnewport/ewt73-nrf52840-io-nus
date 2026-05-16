@@ -65,6 +65,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
     private var scanSession = 0
     private var connectSession = 0
     private var lastStatusFields: Map<String, String> = emptyMap()
+    private var ledWriteInProgress = false
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
 
@@ -372,6 +373,12 @@ class MainActivity : Activity(), JustinBleCallbacks {
         val bondedCount = lastStatusFields["BONDED_COUNT"]?.toIntOrNull() ?: 0
         val isBonded = lastStatusFields["IS_BONDED"]?.toIntOrNull() ?: 0
         val pairMode = lastStatusFields["PAIR_MODE"]?.toIntOrNull() ?: 0
+        val securityLevel = lastStatusFields["SEC_LEVEL"]?.toIntOrNull() ?: 0
+
+        if (ledWriteInProgress) {
+            addLog("LED write already in progress")
+            return
+        }
 
         if (bondedCount == 0 && isBonded == 0 && pairMode == 0) {
             addLog("Device is not bondable now. Hold PAIR 5s, wait PAIR_MODE=1, then press LED.")
@@ -381,8 +388,14 @@ class MainActivity : Activity(), JustinBleCallbacks {
         }
 
         val next = !ledOn
-        addLog("LED secure write requested: ${if (next) "01" else "00"}")
-        manager.writeLedSecure(next)
+        ledWriteInProgress = true
+        ledButton.isEnabled = false
+        addLog("LED write requested: ${if (next) "01" else "00"}")
+        if (bondedCount > 0 && isBonded > 0 && securityLevel >= 2) {
+            manager.writeLed(next)
+        } else {
+            manager.writeLedSecure(next)
+        }
     }
 
     override fun onLiveData(text: String) {
@@ -394,6 +407,8 @@ class MainActivity : Activity(), JustinBleCallbacks {
     }
 
     override fun onLedWriteDone(on: Boolean) {
+        ledWriteInProgress = false
+        ledButton.isEnabled = state == AppState.CONNECTED
         selectedDevice?.let { rememberDevice(it) }
         ledOn = on
         renderLedButton()
@@ -406,6 +421,8 @@ class MainActivity : Activity(), JustinBleCallbacks {
     }
 
     override fun onBleError(message: String) {
+        ledWriteInProgress = false
+        ledButton.isEnabled = state == AppState.CONNECTED
         showError(message)
     }
 
@@ -462,7 +479,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
         mainHandler.post {
             stateView.text = "State: $newState"
             val connected = newState == AppState.CONNECTED
-            ledButton.isEnabled = connected
+            ledButton.isEnabled = connected && !ledWriteInProgress
             readStatusButton.isEnabled = connected
         }
     }
@@ -498,6 +515,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
     private fun closeManager() {
         val manager = bleManager
         bleManager = null
+        ledWriteInProgress = false
         manager?.disconnect()?.then { manager.close() }?.enqueue()
         mainHandler.post {
             ledButton.isEnabled = false
@@ -631,7 +649,7 @@ private class JustinBleManager(
             .enqueue()
     }
 
-    private fun writeLed(on: Boolean) {
+    fun writeLed(on: Boolean) {
         writeCharacteristic(
             ledCharacteristic,
             byteArrayOf(if (on) 0x01 else 0x00),
