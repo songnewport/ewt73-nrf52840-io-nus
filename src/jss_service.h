@@ -29,10 +29,11 @@ struct jss_service_handlers {
 void jss_service_init(const struct jss_service_handlers *handlers);
 void jss_service_set_live_data(const char *text);
 void jss_service_set_status(const char *text);
-int jss_service_notify_live_data(void);
+int jss_service_notify_live_data(struct bt_conn *conn);
 void jss_service_notify_status(void);
 bool jss_service_led_on(void);
 bool jss_service_live_notify_enabled(void);
+bool jss_service_live_is_subscribed(struct bt_conn *conn);
 uint32_t jss_service_live_notify_attempts(void);
 uint32_t jss_service_live_notify_successes(void);
 int jss_service_live_notify_last_err(void);

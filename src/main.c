@@ -516,6 +516,23 @@ static uint16_t active_uatt_mtu(void)
 	return 0;
 }
 
+static struct bt_conn *first_live_subscribed_conn(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (active_conns[i] &&
+		    jss_service_live_is_subscribed(active_conns[i])) {
+			return active_conns[i];
+		}
+	}
+
+	return NULL;
+}
+
+static bool any_live_subscribed_conn(void)
+{
+	return first_live_subscribed_conn() != NULL;
+}
+
 struct bond_match_context {
 	const bt_addr_le_t *addr;
 	bool found;
@@ -578,12 +595,13 @@ static void update_jss_status(void)
 	char status[160];
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.2,MTU=%u,LIVE_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu",
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.3,MTU=%u,LIVE_CCC=%d,LIVE_SUB=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu",
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
 		       (long)atomic_get(&app_led_on),
 		       active_uatt_mtu(),
 		       jss_service_live_notify_enabled() ? 1 : 0,
+		       any_live_subscribed_conn() ? 1 : 0,
 		       (unsigned long)jss_service_live_notify_successes(),
 		       (unsigned long)jss_service_live_notify_attempts(),
 		       jss_service_live_notify_last_err(),
@@ -593,7 +611,7 @@ static void update_jss_status(void)
 
 static void schedule_live_notify(k_timeout_t delay)
 {
-	if (!atomic_get(&ble_connected_count) || !jss_service_live_notify_enabled()) {
+	if (!atomic_get(&ble_connected_count)) {
 		return;
 	}
 
@@ -620,8 +638,9 @@ static void live_notify_work_handler(struct k_work *work)
 {
 	int err;
 	atomic_val_t pipeline;
+	struct bt_conn *conn;
 
-	if (!atomic_get(&ble_connected_count) || !jss_service_live_notify_enabled()) {
+	if (!atomic_get(&ble_connected_count)) {
 		return;
 	}
 
@@ -632,10 +651,11 @@ static void live_notify_work_handler(struct k_work *work)
 		return;
 	}
 
-	err = jss_service_notify_live_data();
+	conn = first_live_subscribed_conn();
+	err = jss_service_notify_live_data(conn);
 	if (err == 0) {
 		atomic_dec(&live_notify_pipeline);
-	} else if (err == -ENOMEM || err == -EAGAIN) {
+	} else if (err == -ENOMEM || err == -EAGAIN || err == -ENOTCONN) {
 		(void)k_work_reschedule(k_work_delayable_from_work(work),
 					 K_MSEC(LIVE_NOTIFICATION_RETRY_MS));
 	}

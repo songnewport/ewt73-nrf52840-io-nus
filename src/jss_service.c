@@ -167,19 +167,25 @@ static void live_notify_complete(struct bt_conn *conn, void *user_data)
 	}
 }
 
-int jss_service_notify_live_data(void)
+int jss_service_notify_live_data(struct bt_conn *conn)
 {
 	int err;
 	struct bt_gatt_notify_params params;
 
-	if (!live_notify_enabled) {
-		live_notify_skips++;
-		return -EACCES;
+	if (!conn) {
+		live_notify_last_err = -ENOTCONN;
+		return -ENOTCONN;
 	}
 
 	if (!live_data_attr) {
 		live_notify_last_err = -ENOENT;
 		return -ENOENT;
+	}
+
+	if (!bt_gatt_is_subscribed(conn, live_data_attr, BT_GATT_CCC_NOTIFY)) {
+		live_notify_skips++;
+		live_notify_last_err = -EACCES;
+		return -EACCES;
 	}
 
 	memset(&params, 0, sizeof(params));
@@ -215,6 +221,15 @@ bool jss_service_led_on(void)
 bool jss_service_live_notify_enabled(void)
 {
 	return live_notify_enabled;
+}
+
+bool jss_service_live_is_subscribed(struct bt_conn *conn)
+{
+	if (!conn || !live_data_attr) {
+		return false;
+	}
+
+	return bt_gatt_is_subscribed(conn, live_data_attr, BT_GATT_CCC_NOTIFY);
 }
 
 uint32_t jss_service_live_notify_attempts(void)
