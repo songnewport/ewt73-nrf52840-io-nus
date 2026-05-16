@@ -163,9 +163,14 @@ class MainActivity : Activity() {
                 BluetoothDevice.BOND_BONDED -> {
                     bondInProgress = false
                     rememberDevice(device)
-                    setState(AppState.CONNECTING)
                     addLog("Bonded: ${device.address}")
-                    connectGattDelayed(device, 1000)
+                    if (gatt == null) {
+                        setState(AppState.CONNECTING)
+                        connectGattDelayed(device, 1000)
+                    } else {
+                        setState(AppState.CONNECTED)
+                        readStatus()
+                    }
                 }
 
                 BluetoothDevice.BOND_NONE -> {
@@ -399,15 +404,13 @@ class MainActivity : Activity() {
             val device = bluetoothAdapter.getRemoteDevice(savedAddress)
             selectedDevice = device
             connectionView.text = "Saved device: $savedAddress"
-            if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                addLog("Connecting saved bonded device")
-                connectGattDelayed(device, 500)
-                return
-            }
+            addLog("Connecting saved device")
+            connectGattDelayed(device, 500)
+            return
         }
 
         setState(AppState.WAIT_PAIR_BUTTON)
-        connectionView.text = "Hold PAIR for 5 seconds, then scan."
+        connectionView.text = "Scan to connect. Hold PAIR only before LED control."
     }
 
     private fun buildUi() {
@@ -552,7 +555,7 @@ class MainActivity : Activity() {
                     setOnClickListener {
                         stopScan()
                         selectedDevice = device
-                        bondOrConnect(device)
+                        connectSelectedDevice(device)
                     }
                 })
             }
@@ -560,22 +563,10 @@ class MainActivity : Activity() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun bondOrConnect(device: BluetoothDevice) {
+    private fun connectSelectedDevice(device: BluetoothDevice) {
         connectionView.text = "${device.address} / bond=${bondStateName(device.bondState)}"
-        if (device.bondState == BluetoothDevice.BOND_BONDED) {
-            rememberDevice(device)
-            connectGattDelayed(device, 500)
-        } else if (device.bondState == BluetoothDevice.BOND_BONDING || bondInProgress) {
-            addLog("Pairing already in progress")
-        } else {
-            setState(AppState.BONDING)
-            addLog("createBond()")
-            bondInProgress = true
-            if (!device.createBond()) {
-                bondInProgress = false
-                showError("createBond() returned false")
-            }
-        }
+        rememberDevice(device)
+        connectGattDelayed(device, 500)
     }
 
     @SuppressLint("MissingPermission")
@@ -646,6 +637,12 @@ class MainActivity : Activity() {
     private fun toggleLed() {
         val currentGatt = gatt ?: return
         val characteristic = ledCharacteristic ?: return
+        val device = selectedDevice
+        if (device != null && device.bondState != BluetoothDevice.BOND_BONDED) {
+            requestPairForLed(device)
+            return
+        }
+
         ledOn = !ledOn
         renderLedButton()
         val value = byteArrayOf(if (ledOn) 0x01 else 0x00)
@@ -668,6 +665,23 @@ class MainActivity : Activity() {
             ledOn = !ledOn
             renderLedButton()
             addLog("LED write could not start")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestPairForLed(device: BluetoothDevice) {
+        if (device.bondState == BluetoothDevice.BOND_BONDING || bondInProgress) {
+            addLog("Pairing already in progress")
+            return
+        }
+
+        setState(AppState.BONDING)
+        addLog("LED control requires bond. Hold PAIR, then confirm pairing.")
+        addLog("createBond()")
+        bondInProgress = true
+        if (!device.createBond()) {
+            bondInProgress = false
+            showError("createBond() returned false")
         }
     }
 
