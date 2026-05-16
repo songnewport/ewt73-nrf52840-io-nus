@@ -792,6 +792,7 @@ class MainActivity : Activity() {
     }
 
     private fun forgetSavedDevice() {
+        removeKnownBonds()
         prefs.edit().clear().apply()
         selectedDevice = null
         connectSession++
@@ -799,6 +800,41 @@ class MainActivity : Activity() {
         setState(AppState.WAIT_PAIR_BUTTON)
         connectionView.text = "Saved device cleared. Hold PAIR 5s, then scan."
         addLog("Saved device cleared")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun removeKnownBonds() {
+        if (!hasPermissions()) {
+            return
+        }
+
+        val savedAddress = prefs.getString("device_address", null)
+        val selectedAddress = selectedDevice?.address
+        val candidates = bluetoothAdapter.bondedDevices.filter { device ->
+            val name = device.name.orEmpty()
+            device.address == savedAddress ||
+                device.address == selectedAddress ||
+                name.startsWith("Justin_Shunt", ignoreCase = true)
+        }
+
+        candidates.forEach { device ->
+            if (removeBond(device)) {
+                addLog("Android bond removed: ${device.address}")
+            } else {
+                addLog("Android bond remove failed: ${device.address}")
+            }
+        }
+    }
+
+    private fun removeBond(device: BluetoothDevice): Boolean {
+        return try {
+            val method = device.javaClass.getMethod("removeBond")
+            method.invoke(device) as? Boolean ?: false
+        } catch (_: ReflectiveOperationException) {
+            false
+        } catch (_: SecurityException) {
+            false
+        }
     }
 
     private fun bondStateName(state: Int): String {
