@@ -75,6 +75,7 @@ static struct bt_conn *active_conns[MAX_CONN];
 static struct k_work_delayable activity_led_off_work;
 static struct k_work_delayable pair_mode_timeout_work;
 static struct k_work_delayable pair_mode_blink_work;
+static struct k_work adv_work;
 static atomic_t pair_short_press_count;
 static atomic_t pair_mode_request_count;
 static atomic_t clear_bonds_request_count;
@@ -101,6 +102,7 @@ static const struct bt_data sd[] = {
 
 static void pair_mode_timeout_handler(struct k_work *work);
 static void pair_mode_blink_handler(struct k_work *work);
+static void advertising_start(void);
 
 static void led_set(const struct gpio_dt_spec *led, int value)
 {
@@ -634,6 +636,30 @@ static void clear_all_bonds(void)
 	}
 }
 
+static void adv_work_handler(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+
+	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	if (err == -EALREADY) {
+		return;
+	}
+
+	if (err) {
+		LOG_ERR("Advertising failed to start (err %d)", err);
+		return;
+	}
+
+	LOG_INF("Advertising successfully started");
+}
+
+static void advertising_start(void)
+{
+	k_work_submit(&adv_work);
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -667,6 +693,12 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	if (!atomic_get(&ble_connected_count)) {
 		led_set(&conn_led, 0);
 	}
+}
+
+static void recycled_cb(void)
+{
+	LOG_INF("Connection object recycled");
+	advertising_start();
 }
 
 static void security_changed(struct bt_conn *conn, bt_security_t level,
@@ -709,6 +741,7 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.recycled = recycled_cb,
 	.security_changed = security_changed,
 };
 
@@ -796,6 +829,8 @@ int main(void)
 		atomic_set(&nrf_temp_ready, 1);
 	}
 
+	k_work_init(&adv_work, adv_work_handler);
+
 	err = bt_conn_auth_info_cb_register(&auth_info_cb);
 	if (err) {
 		error_blink_forever(5);
@@ -818,10 +853,7 @@ int main(void)
 		error_blink_forever(3);
 	}
 
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (err) {
-		error_blink_forever(4);
-	}
+	advertising_start();
 
 	for (;;) {
 		if (!atomic_get(&pair_mode_active)) {
