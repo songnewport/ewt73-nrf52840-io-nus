@@ -24,11 +24,10 @@
 #include <bluetooth/services/nus.h>
 #include <soc.h>
 
+#include "button_control.h"
+
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
-#define SW1_PIN 15
-#define SW3_PIN 20
-#define SW4_PIN 17
 
 #define ADC_AIN1_CHANNEL 0
 #define ADC_AIN4_CHANNEL 1
@@ -51,7 +50,6 @@
 static const struct gpio_dt_spec heartbeat_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec conn_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static const struct gpio_dt_spec activity_led = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
-static const struct device *const gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 static const struct device *const nrf_temp = DEVICE_DT_GET_ANY(nordic_nrf_temp);
 static const struct i2c_dt_spec ina228_i2c = I2C_DT_SPEC_GET(DT_NODELABEL(ina228));
 static const struct adc_dt_spec adc_channels[] = {
@@ -66,7 +64,11 @@ static atomic_t nrf_temp_ready;
 static atomic_t ble_connected;
 static struct bt_conn *current_conn;
 static struct k_work_delayable activity_led_off_work;
+static atomic_t pair_short_press_count;
+static atomic_t pair_mode_request_count;
+static atomic_t clear_bonds_request_count;
 static int cached_adc_init_err = -ENODEV;
+static int cached_button_init_err = -ENODEV;
 static int cached_ina228_init_err = -ENODEV;
 static int cached_nrf_temp_init_err = -ENODEV;
 static int64_t ina228_current_lsb_na;
@@ -150,30 +152,6 @@ static int leds_init(void)
 	k_sem_give(&start_ble_sem);
 
 	return 0;
-}
-
-static int switches_init(void)
-{
-	if (!device_is_ready(gpio0)) {
-		return -ENODEV;
-	}
-
-	(void)gpio_pin_configure(gpio0, SW1_PIN, GPIO_INPUT | GPIO_PULL_UP);
-	(void)gpio_pin_configure(gpio0, SW3_PIN, GPIO_INPUT | GPIO_PULL_UP);
-	(void)gpio_pin_configure(gpio0, SW4_PIN, GPIO_INPUT | GPIO_PULL_UP);
-
-	return 0;
-}
-
-static int switch_pressed(uint32_t pin)
-{
-	int value = gpio_pin_get(gpio0, pin);
-
-	if (value < 0) {
-		return -1;
-	}
-
-	return value == 0 ? 1 : 0;
 }
 
 static int adc_inputs_init(void)
@@ -493,6 +471,28 @@ static struct bt_nus_cb nus_cb = {
 	.received = nus_received,
 };
 
+static void button_event_handler(enum button_control_event event, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	switch (event) {
+	case BUTTON_CONTROL_EVENT_PAIR_SHORT_PRESS:
+		atomic_inc(&pair_short_press_count);
+		activity_pulse();
+		break;
+	case BUTTON_CONTROL_EVENT_ENTER_PAIR_MODE:
+		atomic_inc(&pair_mode_request_count);
+		activity_pulse();
+		break;
+	case BUTTON_CONTROL_EVENT_CLEAR_BONDS_REQUESTED:
+		atomic_inc(&clear_bonds_request_count);
+		activity_pulse();
+		break;
+	default:
+		break;
+	}
+}
+
 int main(void)
 {
 	int err = leds_init();
@@ -502,7 +502,7 @@ int main(void)
 		return err;
 	}
 
-	(void)switches_init();
+	cached_button_init_err = button_control_init(button_event_handler, NULL);
 	cached_adc_init_err = adc_inputs_init();
 	if (!cached_adc_init_err) {
 		atomic_set(&adc_ready, 1);
@@ -547,7 +547,10 @@ int main(void)
 			int ain4_err = cached_adc_init_err;
 			int32_t nrf_temp_x10 = 0;
 			int nrf_temp_err;
-			char line[128];
+			int pair_pressed = button_control_pair_pressed();
+			int sw3_pressed = button_control_sw3_pressed();
+			int sw4_pressed = button_control_sw4_pressed();
+			char line[192];
 			int len;
 
 			if (!cached_adc_init_err) {
@@ -558,18 +561,22 @@ int main(void)
 
 			if (ain1_err || ain4_err) {
 				len = snprintk(line, sizeof(line),
-					       "ADC,seq=%u,ain1_err=%d,ain4_err=%d,sw1=%d,sw3=%d,sw4=%d\r\n",
+					       "ADC,seq=%u,ain1_err=%d,ain4_err=%d,btn_init=%d,sw1=%d,sw3=%d,sw4=%d,pair=%ld/%ld,clear=%ld\r\n",
 					       seq, ain1_err, ain4_err,
-					       switch_pressed(SW1_PIN),
-					       switch_pressed(SW3_PIN),
-					       switch_pressed(SW4_PIN));
+					       cached_button_init_err,
+					       pair_pressed, sw3_pressed, sw4_pressed,
+					       (long)atomic_get(&pair_short_press_count),
+					       (long)atomic_get(&pair_mode_request_count),
+					       (long)atomic_get(&clear_bonds_request_count));
 			} else {
 				len = snprintk(line, sizeof(line),
-					       "ADC,seq=%u,ain1=%u/%ld,ain4=%u/%ld,sw1=%d,sw3=%d,sw4=%d\r\n",
+					       "ADC,seq=%u,ain1=%u/%ld,ain4=%u/%ld,btn_init=%d,sw1=%d,sw3=%d,sw4=%d,pair=%ld/%ld,clear=%ld\r\n",
 					       seq, ain1_raw, (long)ain1_mv, ain4_raw, (long)ain4_mv,
-					       switch_pressed(SW1_PIN),
-					       switch_pressed(SW3_PIN),
-					       switch_pressed(SW4_PIN));
+					       cached_button_init_err,
+					       pair_pressed, sw3_pressed, sw4_pressed,
+					       (long)atomic_get(&pair_short_press_count),
+					       (long)atomic_get(&pair_mode_request_count),
+					       (long)atomic_get(&clear_bonds_request_count));
 			}
 
 			if (len > 0) {

@@ -19,7 +19,8 @@ nRF52840 nrf_temp_x10 = 220
 
 - BLE Nordic UART Service peripheral
 - LED heartbeat and connection indication
-- Switch inputs
+- Devicetree-based button inputs
+- Interrupt-based PAIR button events
 - SAADC readings on AIN1 and AIN4
 - INA228 over I2C
 - nRF52840 internal die temperature
@@ -44,6 +45,17 @@ nRF52840 nrf_temp_x10 = 220
 ADC,seq=12,ain1=3805/3344,ain4=0/0,sw1=0,sw3=0,sw4=0
 INA,seq=12,vbus_mv=3329,shunt_uv=0,current_ma=0,power_mw=0,temp_x10=216,nrf_temp_x10=220
 ```
+
+After the button refactor, the ADC line also includes button subsystem status:
+
+```text
+ADC,seq=12,ain1=3805/3344,ain4=0/0,btn_init=0,sw1=0,sw3=0,sw4=0,pair=1/0,clear=0
+```
+
+Button counters:
+
+- `pair=a/b` means `a` short presses and `b` 5-second pair-mode requests
+- `clear=c` means `c` 10-second clear-bonds requests
 
 Temperature fields use x10 Celsius:
 
@@ -72,3 +84,21 @@ snapshots/ina228_nrf_temp_ok_2026-05-15
 ```
 
 It includes source files and a tested `merged.hex`.
+
+## Button Architecture
+
+Buttons are defined in devicetree with `gpio-keys` and `sw0`/`sw1`/`sw2`
+aliases. Application code does not hardcode button pin numbers.
+
+`src/button_control.c` owns the PAIR button interrupt and event generation:
+
+- `gpio_pin_interrupt_configure_dt()` enables edge interrupts
+- `gpio_init_callback()` and `gpio_add_callback()` register the GPIO callback
+- the ISR only schedules debounce work
+- `k_work_delayable` handles debounce and long-press timers
+
+PAIR button behavior:
+
+- short press: increments short press counter
+- hold 5 seconds: generates pair-mode request
+- hold 10 seconds: generates clear-bonds request
