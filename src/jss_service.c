@@ -32,6 +32,8 @@ static char device_status[JSS_TEXT_MAX_LEN] = "PAIR_MODE=0,BONDED_COUNT=0,LED=0,
 static bool led_on;
 static bool live_notify_enabled;
 static bool status_notify_enabled;
+static const struct bt_gatt_attr *live_data_attr;
+static const struct bt_gatt_attr *device_status_attr;
 
 static ssize_t read_text(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			 void *buf, uint16_t len, uint16_t offset)
@@ -124,6 +126,11 @@ void jss_service_init(const struct jss_service_handlers *handlers)
 	if (handlers) {
 		service_handlers = *handlers;
 	}
+
+	live_data_attr = bt_gatt_find_by_uuid(jss_svc.attrs, jss_svc.attr_count,
+					      &jss_live_data_uuid.uuid);
+	device_status_attr = bt_gatt_find_by_uuid(jss_svc.attrs, jss_svc.attr_count,
+						  &jss_device_status_uuid.uuid);
 }
 
 void jss_service_set_live_data(const char *text)
@@ -150,7 +157,11 @@ void jss_service_notify_live_data(void)
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, &jss_svc.attrs[2], live_data, strlen(live_data));
+	if (!live_data_attr) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, live_data_attr, live_data, strlen(live_data));
 }
 
 void jss_service_notify_status(void)
@@ -159,7 +170,11 @@ void jss_service_notify_status(void)
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, &jss_svc.attrs[7], device_status, strlen(device_status));
+	if (!device_status_attr) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, device_status_attr, device_status, strlen(device_status));
 }
 
 bool jss_service_led_on(void)
