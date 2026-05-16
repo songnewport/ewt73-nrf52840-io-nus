@@ -73,6 +73,9 @@ class MainActivity : Activity() {
     private var scanSession = 0
     private var connectSession = 0
     private var gattRetryCount = 0
+    private var liveNotifyCount = 0
+    private var liveReadFallbackActive = false
+    private var readInProgress = false
     private var descriptorWriteInProgress = false
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
@@ -243,7 +246,9 @@ class MainActivity : Activity() {
 
             if (notifyQueue.isEmpty()) {
                 setState(AppState.CONNECTED)
-                readStatus()
+                readLiveData()
+                mainHandler.postDelayed({ readStatus() }, 300)
+                startLiveReadFallback()
             } else {
                 processNextNotification(gatt)
             }
@@ -254,6 +259,9 @@ class MainActivity : Activity() {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            if (characteristic.uuid == liveDataUuid) {
+                liveNotifyCount++
+            }
             handleCharacteristicText(characteristic.uuid, value.decodeToString())
         }
 
@@ -262,6 +270,9 @@ class MainActivity : Activity() {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
+            if (characteristic.uuid == liveDataUuid) {
+                liveNotifyCount++
+            }
             @Suppress("DEPRECATION")
             handleCharacteristicText(characteristic.uuid, characteristic.value?.decodeToString().orEmpty())
         }
@@ -275,6 +286,7 @@ class MainActivity : Activity() {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 handleCharacteristicText(characteristic.uuid, value.decodeToString())
             } else {
+                readInProgress = false
                 addLog("Read failed: $status")
             }
         }
@@ -289,6 +301,7 @@ class MainActivity : Activity() {
                 @Suppress("DEPRECATION")
                 handleCharacteristicText(characteristic.uuid, characteristic.value?.decodeToString().orEmpty())
             } else {
+                readInProgress = false
                 addLog("Read failed: $status")
             }
         }
@@ -529,6 +542,7 @@ class MainActivity : Activity() {
     private fun connectGatt(device: BluetoothDevice) {
         stopScan()
         closeGatt()
+        liveNotifyCount = 0
         selectedDevice = device
         setState(AppState.CONNECTING)
         connectionView.text = "Connecting ${device.address}"
@@ -621,10 +635,26 @@ class MainActivity : Activity() {
     private fun readStatus() {
         val currentGatt = gatt ?: return
         val characteristic = statusCharacteristic ?: return
+        if (readInProgress) {
+            return
+        }
+        readInProgress = true
+        currentGatt.readCharacteristic(characteristic)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readLiveData() {
+        val currentGatt = gatt ?: return
+        val characteristic = liveCharacteristic ?: return
+        if (readInProgress) {
+            return
+        }
+        readInProgress = true
         currentGatt.readCharacteristic(characteristic)
     }
 
     private fun handleCharacteristicText(uuid: UUID, text: String) {
+        readInProgress = false
         if (text.isBlank()) {
             return
         }
@@ -633,6 +663,24 @@ class MainActivity : Activity() {
             liveDataUuid -> showLiveData(text)
             statusUuid -> showStatus(text)
         }
+    }
+
+    private fun startLiveReadFallback() {
+        val thisConnectSession = connectSession
+        liveReadFallbackActive = true
+        mainHandler.postDelayed(object : Runnable {
+            override fun run() {
+                if (!liveReadFallbackActive || connectSession != thisConnectSession) {
+                    return
+                }
+
+                if (state == AppState.CONNECTED && liveNotifyCount == 0) {
+                    addLog("Live notify missing, reading live data")
+                    readLiveData()
+                    mainHandler.postDelayed(this, 1000)
+                }
+            }
+        }, 3000)
     }
 
     private fun showLiveData(text: String) {
@@ -721,6 +769,9 @@ class MainActivity : Activity() {
     private fun closeGatt() {
         notifyQueue.clear()
         descriptorWriteInProgress = false
+        liveReadFallbackActive = false
+        liveNotifyCount = 0
+        readInProgress = false
         gatt?.close()
         gatt = null
         liveCharacteristic = null
