@@ -71,6 +71,8 @@ class MainActivity : Activity() {
     private var ledOn = false
     private var isScanning = false
     private var scanSession = 0
+    private var connectSession = 0
+    private var gattRetryCount = 0
     private var descriptorWriteInProgress = false
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
@@ -151,7 +153,7 @@ class MainActivity : Activity() {
                     rememberDevice(device)
                     setState(AppState.CONNECTING)
                     addLog("Bonded: ${device.address}")
-                    connectGatt(device)
+                    connectGattDelayed(device, 1000)
                 }
 
                 BluetoothDevice.BOND_NONE -> {
@@ -166,13 +168,20 @@ class MainActivity : Activity() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 addLog("GATT error: $status")
+                val device = selectedDevice
                 closeGatt()
                 setState(AppState.DISCONNECTED)
+                if (status == 133 && device != null && gattRetryCount == 0) {
+                    gattRetryCount++
+                    addLog("Retrying GATT once after 133")
+                    connectGattDelayed(device, 1200)
+                }
                 return
             }
 
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    gattRetryCount = 0
                     setState(AppState.DISCOVERING)
                     addLog("Connected, discovering services")
                     gatt.discoverServices()
@@ -348,7 +357,7 @@ class MainActivity : Activity() {
             connectionView.text = "Saved device: $savedAddress"
             if (device.bondState == BluetoothDevice.BOND_BONDED) {
                 addLog("Connecting saved bonded device")
-                connectGatt(device)
+                connectGattDelayed(device, 500)
                 return
             }
         }
@@ -461,6 +470,7 @@ class MainActivity : Activity() {
         }
 
         closeGatt()
+        connectSession++
         stopScan()
         val thisScanSession = ++scanSession
         foundDevices.clear()
@@ -505,7 +515,7 @@ class MainActivity : Activity() {
         connectionView.text = "${device.address} / bond=${bondStateName(device.bondState)}"
         if (device.bondState == BluetoothDevice.BOND_BONDED) {
             rememberDevice(device)
-            connectGatt(device)
+            connectGattDelayed(device, 500)
         } else {
             setState(AppState.BONDING)
             addLog("createBond()")
@@ -517,11 +527,22 @@ class MainActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     private fun connectGatt(device: BluetoothDevice) {
+        stopScan()
         closeGatt()
         selectedDevice = device
         setState(AppState.CONNECTING)
         connectionView.text = "Connecting ${device.address}"
         gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private fun connectGattDelayed(device: BluetoothDevice, delayMs: Long) {
+        val thisConnectSession = ++connectSession
+        addLog("Connect scheduled in ${delayMs}ms")
+        mainHandler.postDelayed({
+            if (connectSession == thisConnectSession) {
+                connectGatt(device)
+            }
+        }, delayMs)
     }
 
     private fun enqueueNotification(characteristic: BluetoothGattCharacteristic?) {
@@ -722,6 +743,7 @@ class MainActivity : Activity() {
     private fun forgetSavedDevice() {
         prefs.edit().clear().apply()
         selectedDevice = null
+        connectSession++
         closeGatt()
         setState(AppState.WAIT_PAIR_BUTTON)
         connectionView.text = "Saved device cleared. Hold PAIR 5s, then scan."
