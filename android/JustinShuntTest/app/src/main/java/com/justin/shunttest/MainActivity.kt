@@ -37,6 +37,7 @@ private enum class AppState {
     SCANNING,
     CONNECTING,
     DISCOVERING,
+    GATT_INIT,
     CONNECTED,
     DISCONNECTED,
     ERROR
@@ -50,6 +51,8 @@ private val LED_CONTROL_UUID: UUID =
     UUID.fromString("12345678-1234-5678-1234-56789abcdef2")
 private val STATUS_UUID: UUID =
     UUID.fromString("12345678-1234-5678-1234-56789abcdef3")
+private val SECURE_INFO_UUID: UUID =
+    UUID.fromString("12345678-1234-5678-1234-56789abcdef4")
 
 class MainActivity : Activity(), JustinBleCallbacks {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -64,8 +67,10 @@ class MainActivity : Activity(), JustinBleCallbacks {
     private var isScanning = false
     private var scanSession = 0
     private var connectSession = 0
+    private var activeCallbackToken = 0
     private var lastStatusFields: Map<String, String> = emptyMap()
     private var ledWriteInProgress = false
+    private var secureReady = false
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
 
@@ -73,6 +78,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
     private lateinit var stateView: TextView
     private lateinit var connectionView: TextView
     private lateinit var liveView: TextView
+    private lateinit var secureView: TextView
     private lateinit var statusView: TextView
     private lateinit var devicesView: LinearLayout
     private lateinit var logView: TextView
@@ -157,7 +163,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
         }
 
         setState(AppState.WAIT_PAIR_BUTTON)
-        connectionView.text = "Scan to connect. Hold PAIR only before LED control."
+        connectionView.text = "First use: hold PAIR until blinking, then scan and tap the shunt."
     }
 
     private fun buildUi() {
@@ -169,6 +175,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
         stateView = bodyText()
         connectionView = bodyText()
         liveView = monoPanel("Live data waiting...")
+        secureView = monoPanel("Secure info waiting...")
         statusView = monoPanel("Status waiting...")
         devicesView = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         logView = monoPanel("")
@@ -204,6 +211,8 @@ class MainActivity : Activity(), JustinBleCallbacks {
         root.addView(clearLogButton)
         root.addView(sectionLabel("Live Data"))
         root.addView(liveView)
+        root.addView(sectionLabel("Secure Info"))
+        root.addView(secureView)
         root.addView(sectionLabel("Device Status"))
         root.addView(statusView)
         root.addView(sectionLabel("Found Devices"))
@@ -267,6 +276,12 @@ class MainActivity : Activity(), JustinBleCallbacks {
             return
         }
 
+        if (state == AppState.CONNECTING || state == AppState.DISCOVERING ||
+            state == AppState.GATT_INIT || state == AppState.CONNECTED) {
+            addLog("Scan ignored while $state")
+            return
+        }
+
         closeManager()
         connectSession++
         stopScan()
@@ -282,7 +297,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
         mainHandler.postDelayed({
             if (scanSession == thisScanSession && state == AppState.SCANNING && foundDevices.isEmpty()) {
                 stopScan()
-                connectionView.text = "No device found. Hold PAIR 5s and scan again."
+                connectionView.text = "No shunt found. Move closer, hold PAIR until blinking, then scan again."
                 setState(AppState.WAIT_PAIR_BUTTON)
             }
         }, 12000)
@@ -310,14 +325,22 @@ class MainActivity : Activity(), JustinBleCallbacks {
 
     @SuppressLint("MissingPermission")
     private fun connectDevice(device: BluetoothDevice) {
+        if (state == AppState.CONNECTING || state == AppState.DISCOVERING ||
+            state == AppState.GATT_INIT || state == AppState.CONNECTED) {
+            addLog("Connect ignored while $state")
+            return
+        }
+
         stopScan()
         closeManager()
         selectedDevice = device
+        secureReady = false
         setState(AppState.CONNECTING)
         connectionView.text = "Connecting ${device.address} / bond=${bondStateName(device.bondState)}"
 
         val thisConnectSession = ++connectSession
-        val manager = JustinBleManager(this, this).also { bleManager = it }
+        activeCallbackToken = thisConnectSession
+        val manager = JustinBleManager(this, this, thisConnectSession).also { bleManager = it }
         manager.setConnectionObserver(object : ConnectionObserver {
             override fun onDeviceConnecting(device: BluetoothDevice) {
                 if (connectSession == thisConnectSession) {
@@ -343,9 +366,8 @@ class MainActivity : Activity(), JustinBleCallbacks {
                 if (connectSession == thisConnectSession) {
                     setState(AppState.CONNECTED)
                     connectionView.text = "Connected ${device.address}"
-                    addLog("Device ready")
-                    manager.readLiveData()
-                    manager.readStatus()
+                    rememberDevice(device)
+                    addLog("BLE manager initialized")
                 }
             }
 
@@ -362,9 +384,13 @@ class MainActivity : Activity(), JustinBleCallbacks {
         })
 
         manager.connect(device)
-            .retry(3, 300)
+            .retry(1, 300)
             .timeout(15000)
-            .fail { _, status -> showError("Connect/init failed: $status") }
+            .fail { _, status ->
+                if (connectSession == thisConnectSession) {
+                    showError("Connect/init failed: $status")
+                }
+            }
             .enqueue()
     }
 
@@ -372,7 +398,6 @@ class MainActivity : Activity(), JustinBleCallbacks {
         val manager = bleManager ?: return
         val bondedCount = lastStatusFields["BONDED_COUNT"]?.toIntOrNull() ?: 0
         val isBonded = lastStatusFields["IS_BONDED"]?.toIntOrNull() ?: 0
-        val pairMode = lastStatusFields["PAIR_MODE"]?.toIntOrNull() ?: 0
         val securityLevel = lastStatusFields["SEC_LEVEL"]?.toIntOrNull() ?: 0
 
         if (ledWriteInProgress) {
@@ -380,9 +405,9 @@ class MainActivity : Activity(), JustinBleCallbacks {
             return
         }
 
-        if (bondedCount == 0 && isBonded == 0 && pairMode == 0) {
-            addLog("Device is not bondable now. Hold PAIR 5s, wait PAIR_MODE=1, then press LED.")
-            connectionView.text = "Hold PAIR 5s first. Wait PAIR_MODE=1, then press LED."
+        if (bondedCount == 0 && isBonded == 0 && securityLevel < 2) {
+            addLog("Secure read not ready. Hold PAIR until blinking, reconnect, and accept pairing.")
+            connectionView.text = "Hold PAIR until blinking, reconnect, and accept pairing."
             manager.readStatus()
             return
         }
@@ -394,15 +419,25 @@ class MainActivity : Activity(), JustinBleCallbacks {
         manager.writeLed(next)
     }
 
-    override fun onLiveData(text: String) {
+    override fun onLiveData(token: Int, text: String) {
+        if (!isActiveToken(token)) return
         showLiveData(text)
     }
 
-    override fun onStatus(text: String) {
+    override fun onSecureInfo(token: Int, text: String) {
+        if (!isActiveToken(token)) return
+        secureReady = true
+        showSecureInfo(text)
+        setState(AppState.CONNECTED)
+    }
+
+    override fun onStatus(token: Int, text: String) {
+        if (!isActiveToken(token)) return
         showStatus(text)
     }
 
-    override fun onLedWriteDone(on: Boolean) {
+    override fun onLedWriteDone(token: Int, on: Boolean) {
+        if (!isActiveToken(token)) return
         ledWriteInProgress = false
         ledButton.isEnabled = state == AppState.CONNECTED
         selectedDevice?.let { rememberDevice(it) }
@@ -412,13 +447,24 @@ class MainActivity : Activity(), JustinBleCallbacks {
         bleManager?.readStatus()
     }
 
-    override fun onBleLog(message: String) {
+    override fun onGattInit(token: Int) {
+        if (!isActiveToken(token)) return
+        setState(AppState.GATT_INIT)
+    }
+
+    override fun onBleLog(token: Int, message: String) {
+        if (!isActiveToken(token)) return
         addLog(message)
     }
 
-    override fun onBleError(message: String) {
+    override fun onBleError(token: Int, message: String) {
+        if (!isActiveToken(token)) return
         ledWriteInProgress = false
         ledButton.isEnabled = state == AppState.CONNECTED
+        if (message.contains("137")) {
+            showPairRequired("Secure read failed: 137. Hold PAIR until blinking, reconnect, and accept pairing.")
+            return
+        }
         showError(message)
     }
 
@@ -430,6 +476,20 @@ class MainActivity : Activity(), JustinBleCallbacks {
                 "Current      ${fields["I"] ?: "--"} mA",
                 "Temperature  ${fields["T"] ?: "--"} C",
                 "SOC          ${fields["SOC"] ?: "--"} %",
+                "",
+                "Raw: $text"
+            ).joinToString("\n")
+        }
+    }
+
+    private fun showSecureInfo(text: String) {
+        val fields = parseFields(text)
+        mainHandler.post {
+            connectionView.text = "Secure connection ready"
+            secureView.text = listOf(
+                "Serial       ${fields["SERIAL"] ?: "--"}",
+                "Firmware     ${fields["FW"] ?: "--"}",
+                "Provisioned  ${fields["PROVISIONED"] ?: "--"}",
                 "",
                 "Raw: $text"
             ).joinToString("\n")
@@ -474,14 +534,27 @@ class MainActivity : Activity(), JustinBleCallbacks {
         state = newState
         mainHandler.post {
             stateView.text = "State: $newState"
+            val busy = newState == AppState.CONNECTING ||
+                newState == AppState.DISCOVERING ||
+                newState == AppState.GATT_INIT ||
+                newState == AppState.CONNECTED
             val connected = newState == AppState.CONNECTED
-            ledButton.isEnabled = connected && !ledWriteInProgress
-            readStatusButton.isEnabled = connected
+            scanButton.isEnabled = !busy
+            ledButton.isEnabled = connected && secureReady && !ledWriteInProgress
+            readStatusButton.isEnabled = connected && secureReady
         }
     }
 
     private fun showError(message: String) {
         setState(AppState.ERROR)
+        addLog(message)
+        mainHandler.post {
+            connectionView.text = message
+        }
+    }
+
+    private fun showPairRequired(message: String) {
+        setState(AppState.WAIT_PAIR_BUTTON)
         addLog(message)
         mainHandler.post {
             connectionView.text = message
@@ -509,14 +582,20 @@ class MainActivity : Activity(), JustinBleCallbacks {
     }
 
     private fun closeManager() {
+        activeCallbackToken = ++connectSession
         val manager = bleManager
         bleManager = null
         ledWriteInProgress = false
+        secureReady = false
         manager?.disconnect()?.then { manager.close() }?.enqueue()
         mainHandler.post {
             ledButton.isEnabled = false
             readStatusButton.isEnabled = false
         }
+    }
+
+    private fun isActiveToken(token: Int): Boolean {
+        return token == activeCallbackToken
     }
 
     @SuppressLint("MissingPermission")
@@ -529,6 +608,9 @@ class MainActivity : Activity(), JustinBleCallbacks {
 
     private fun forgetSavedDevice() {
         val manager = bleManager
+        bleManager = null
+        ledWriteInProgress = false
+        secureReady = false
         prefs.edit().clear().apply()
         selectedDevice = null
         connectSession++
@@ -538,7 +620,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
             closeManager()
         }
         setState(AppState.WAIT_PAIR_BUTTON)
-        connectionView.text = "Saved device cleared. Hold PAIR 5s, then scan."
+        connectionView.text = "Saved device cleared. Hold PAIR until blinking, then scan."
         addLog("Saved device cleared")
     }
 
@@ -559,55 +641,57 @@ class MainActivity : Activity(), JustinBleCallbacks {
 }
 
 private interface JustinBleCallbacks {
-    fun onLiveData(text: String)
-    fun onStatus(text: String)
-    fun onLedWriteDone(on: Boolean)
-    fun onBleLog(message: String)
-    fun onBleError(message: String)
+    fun onLiveData(token: Int, text: String)
+    fun onSecureInfo(token: Int, text: String)
+    fun onStatus(token: Int, text: String)
+    fun onLedWriteDone(token: Int, on: Boolean)
+    fun onGattInit(token: Int)
+    fun onBleLog(token: Int, message: String)
+    fun onBleError(token: Int, message: String)
 }
 
 private class JustinBleManager(
     context: Context,
-    private val appCallbacks: JustinBleCallbacks
+    private val appCallbacks: JustinBleCallbacks,
+    private val callbackToken: Int
 ) : BleManager(context) {
     private var liveCharacteristic: BluetoothGattCharacteristic? = null
     private var ledCharacteristic: BluetoothGattCharacteristic? = null
     private var statusCharacteristic: BluetoothGattCharacteristic? = null
+    private var secureInfoCharacteristic: BluetoothGattCharacteristic? = null
 
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
         val service = gatt.getService(JUSTIN_SERVICE_UUID) ?: return false
         liveCharacteristic = service.getCharacteristic(LIVE_DATA_UUID)
         ledCharacteristic = service.getCharacteristic(LED_CONTROL_UUID)
         statusCharacteristic = service.getCharacteristic(STATUS_UUID)
-        return liveCharacteristic != null && ledCharacteristic != null && statusCharacteristic != null
+        secureInfoCharacteristic = service.getCharacteristic(SECURE_INFO_UUID)
+        return liveCharacteristic != null && ledCharacteristic != null &&
+            statusCharacteristic != null && secureInfoCharacteristic != null
     }
 
     override fun initialize() {
         setNotificationCallback(liveCharacteristic)
-            .with { _, data -> appCallbacks.onLiveData(data.toUtf8()) }
+            .with { _, data -> appCallbacks.onLiveData(callbackToken, data.toUtf8()) }
         setNotificationCallback(statusCharacteristic)
-            .with { _, data -> appCallbacks.onStatus(data.toUtf8()) }
+            .with { _, data -> appCallbacks.onStatus(callbackToken, data.toUtf8()) }
 
         beginAtomicRequestQueue()
             .add(
                 requestMtu(247)
-                    .with { _, mtu -> appCallbacks.onBleLog("MTU changed: $mtu") }
-                    .fail { _, status -> appCallbacks.onBleLog("MTU request failed: $status") }
+                    .with { _, mtu -> appCallbacks.onBleLog(callbackToken, "MTU changed: $mtu") }
+                    .fail { _, status -> appCallbacks.onBleLog(callbackToken, "MTU request failed: $status") }
             )
             .add(
-                enableNotifications(liveCharacteristic)
-                    .done { appCallbacks.onBleLog("Live data notifications enabled") }
-            )
-            .add(
-                enableNotifications(statusCharacteristic)
-                    .done { appCallbacks.onBleLog("Device status notifications enabled") }
+                readCharacteristic(statusCharacteristic)
+                    .with { _, data -> appCallbacks.onStatus(callbackToken, data.toUtf8()) }
+                    .fail { _, status -> appCallbacks.onBleLog(callbackToken, "Initial status read failed: $status") }
             )
             .done {
-                appCallbacks.onBleLog("Device ready")
-                readStatus()
-                readLiveData()
+                appCallbacks.onBleLog(callbackToken, "Public init ready")
+                readSecureInfoOnce()
             }
-            .fail { _, status -> appCallbacks.onBleError("GATT init failed: $status") }
+            .fail { _, status -> appCallbacks.onBleError(callbackToken, "GATT init failed: $status") }
             .enqueue()
     }
 
@@ -615,26 +699,58 @@ private class JustinBleManager(
         liveCharacteristic = null
         ledCharacteristic = null
         statusCharacteristic = null
+        secureInfoCharacteristic = null
     }
 
     fun readLiveData() {
         readCharacteristic(liveCharacteristic)
-            .with { _, data -> appCallbacks.onLiveData(data.toUtf8()) }
-            .fail { _, status -> appCallbacks.onBleLog("Live read failed: $status") }
+            .with { _, data -> appCallbacks.onLiveData(callbackToken, data.toUtf8()) }
+            .fail { _, status -> appCallbacks.onBleLog(callbackToken, "Live read failed: $status") }
             .enqueue()
     }
 
     fun readStatus() {
         readCharacteristic(statusCharacteristic)
-            .with { _, data -> appCallbacks.onStatus(data.toUtf8()) }
-            .fail { _, status -> appCallbacks.onBleLog("Status read failed: $status") }
+            .with { _, data -> appCallbacks.onStatus(callbackToken, data.toUtf8()) }
+            .fail { _, status -> appCallbacks.onBleLog(callbackToken, "Status read failed: $status") }
+            .enqueue()
+    }
+
+    private fun readSecureInfoOnce() {
+        readCharacteristic(secureInfoCharacteristic)
+            .before { appCallbacks.onGattInit(callbackToken) }
+            .with { _, data ->
+                appCallbacks.onBleLog(callbackToken, "Secure read OK")
+                appCallbacks.onSecureInfo(callbackToken, data.toUtf8())
+            }
+            .done { enableAppNotifications() }
+            .fail { _, status -> appCallbacks.onBleError(callbackToken, "Secure read failed: $status") }
+            .enqueue()
+    }
+
+    private fun enableAppNotifications() {
+        beginAtomicRequestQueue()
+            .add(
+                enableNotifications(liveCharacteristic)
+                    .done { appCallbacks.onBleLog(callbackToken, "Live data notifications enabled") }
+            )
+            .add(
+                enableNotifications(statusCharacteristic)
+                    .done { appCallbacks.onBleLog(callbackToken, "Device status notifications enabled") }
+            )
+            .done {
+                appCallbacks.onBleLog(callbackToken, "Device ready")
+                readStatus()
+                readLiveData()
+            }
+            .fail { _, status -> appCallbacks.onBleError(callbackToken, "Notify init failed: $status") }
             .enqueue()
     }
 
     fun removeBondAndDisconnect() {
         removeBond()
-            .done { appCallbacks.onBleLog("Android bond removed") }
-            .fail { _, status -> appCallbacks.onBleLog("Remove bond failed: $status") }
+            .done { appCallbacks.onBleLog(callbackToken, "Android bond removed") }
+            .fail { _, status -> appCallbacks.onBleLog(callbackToken, "Remove bond failed: $status") }
             .then {
                 disconnect().then { close() }.enqueue()
             }
@@ -647,8 +763,8 @@ private class JustinBleManager(
             byteArrayOf(if (on) 0x01 else 0x00),
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         )
-            .done { appCallbacks.onLedWriteDone(on) }
-            .fail { _, status -> appCallbacks.onBleError("LED write failed: $status") }
+            .done { appCallbacks.onLedWriteDone(callbackToken, on) }
+            .fail { _, status -> appCallbacks.onBleError(callbackToken, "LED write failed: $status") }
             .enqueue()
     }
 }

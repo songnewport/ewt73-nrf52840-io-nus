@@ -11,6 +11,10 @@
 #define JSS_LIVE_DATA_UUID_STR "12345678-1234-5678-1234-56789abcdef1"
 #define JSS_LED_CONTROL_UUID_STR "12345678-1234-5678-1234-56789abcdef2"
 #define JSS_DEVICE_STATUS_UUID_STR "12345678-1234-5678-1234-56789abcdef3"
+#define JSS_SECURE_INFO_UUID_STR "12345678-1234-5678-1234-56789abcdef4"
+
+#define JSS_FW_VERSION "0.2.7-SECURE-READ-DEMO"
+#define JSS_DEVICE_SERIAL "DEMO-170526"
 
 #define JSS_SERVICE_UUID_VAL BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
 
@@ -25,6 +29,7 @@ struct jss_service_handlers {
 void jss_service_init(const struct jss_service_handlers *handlers);
 void jss_service_set_live_data(const char *text);
 void jss_service_set_status(const char *text);
+void jss_service_set_secure_info(const char *text);
 int jss_service_notify_live_data(struct bt_conn *conn);
 void jss_service_notify_status(void);
 bool jss_service_led_on(void);

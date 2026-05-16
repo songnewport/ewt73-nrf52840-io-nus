@@ -1,6 +1,6 @@
 /*
  * E73 nRF52840 BLE NUS + JSS official baseline firmware.
- * FW version: 0.2.6-OFFICIAL-BASELINE
+ * FW version: 0.2.7-SECURE-READ-DEMO
  *
  * Aligned with Nordic official peripheral_uart sample (sdk-nrf).
  *
@@ -629,7 +629,7 @@ static void update_jss_status(void)
 	char status[256];
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.6-OFFICIAL-BASELINE,"
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=" JSS_FW_VERSION ","
 		       "MTU=%u,SEC_LEVEL=%u,IS_BONDED=%d,LIVE_CCC=%d,LIVE_SUB=%d,"
 		       "STATUS_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu,"
 		       "LAST_WRITE_ERR=%d",
@@ -721,6 +721,20 @@ static void clear_all_bonds(void)
 	} else {
 		nus_send_text("SECURITY,CLEAR_BONDS_OK\r\n");
 	}
+}
+
+static void reset_bonds_and_enter_pair_mode(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		if (active_conns[i]) {
+			(void)bt_conn_disconnect(active_conns[i], BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		}
+	}
+
+	(void)bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+	refresh_bonded_count();
+	enter_pair_mode();
+	nus_send_text("SECURITY,CLEAR_BONDS_AND_PAIR_MODE_ON\r\n");
 }
 
 /* ---------- Advertising ---------- */
@@ -902,7 +916,7 @@ static void button_event_handler(enum button_control_event event, void *user_dat
 		snprintk(line, sizeof(line), "BUTTON,ENTER_PAIR_MODE,count=%ld\r\n",
 			 (long)atomic_get(&pair_mode_request_count));
 		nus_send_text(line);
-		enter_pair_mode();
+		reset_bonds_and_enter_pair_mode();
 		break;
 	case BUTTON_CONTROL_EVENT_CLEAR_BONDS_REQUESTED:
 		atomic_inc(&clear_bonds_request_count);

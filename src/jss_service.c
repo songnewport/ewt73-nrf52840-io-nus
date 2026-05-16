@@ -33,6 +33,9 @@ static const struct bt_uuid_128 jss_led_control_uuid =
 static const struct bt_uuid_128 jss_device_status_uuid =
 	BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234,
 					    0x56789abcdef3));
+static const struct bt_uuid_128 jss_secure_info_uuid =
+	BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234,
+					    0x56789abcdef4));
 
 static struct jss_service_handlers service_handlers;
 
@@ -40,9 +43,11 @@ static struct jss_service_handlers service_handlers;
  * read from BLE system workqueue thread (GATT read / notify). */
 static K_MUTEX_DEFINE(live_data_mutex);
 static K_MUTEX_DEFINE(status_mutex);
+static K_MUTEX_DEFINE(secure_info_mutex);
 
 static char live_data[JSS_TEXT_MAX_LEN] = "V=0.000,I=0,T=0,SOC=0";
-static char device_status[JSS_TEXT_MAX_LEN] = "PAIR_MODE=0,BONDED_COUNT=0,LED=0,FW=0.2.6-OFFICIAL-BASELINE,IS_BONDED=0";
+static char device_status[JSS_TEXT_MAX_LEN] = "PAIR_MODE=0,BONDED_COUNT=0,LED=0,FW=" JSS_FW_VERSION ",IS_BONDED=0";
+static char secure_info[JSS_TEXT_MAX_LEN] = "SERIAL=" JSS_DEVICE_SERIAL ",FW=" JSS_FW_VERSION ",PROVISIONED=0";
 static bool led_on;
 static bool live_notify_enabled;
 static bool status_notify_enabled;
@@ -78,6 +83,19 @@ static ssize_t read_device_status(struct bt_conn *conn, const struct bt_gatt_att
 	ret = bt_gatt_attr_read(conn, attr, buf, len, offset,
 				device_status, strlen(device_status));
 	k_mutex_unlock(&status_mutex);
+
+	return ret;
+}
+
+static ssize_t read_secure_info(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset)
+{
+	ssize_t ret;
+
+	k_mutex_lock(&secure_info_mutex, K_FOREVER);
+	ret = bt_gatt_attr_read(conn, attr, buf, len, offset,
+				secure_info, strlen(secure_info));
+	k_mutex_unlock(&secure_info_mutex);
 
 	return ret;
 }
@@ -155,6 +173,10 @@ BT_GATT_SERVICE_DEFINE(jss_svc,
 			       BT_GATT_PERM_READ,
 			       read_device_status, NULL, NULL),
 	BT_GATT_CCC(status_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CHARACTERISTIC(&jss_secure_info_uuid.uuid,
+			       BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ_ENCRYPT,
+			       read_secure_info, NULL, NULL),
 );
 
 /* ---------- Public API ---------- */
@@ -199,6 +221,17 @@ void jss_service_set_status(const char *text)
 	k_mutex_lock(&status_mutex, K_FOREVER);
 	(void)snprintk(device_status, sizeof(device_status), "%s", text);
 	k_mutex_unlock(&status_mutex);
+}
+
+void jss_service_set_secure_info(const char *text)
+{
+	if (!text) {
+		return;
+	}
+
+	k_mutex_lock(&secure_info_mutex, K_FOREVER);
+	(void)snprintk(secure_info, sizeof(secure_info), "%s", text);
+	k_mutex_unlock(&secure_info_mutex);
 }
 
 int jss_service_notify_live_data(struct bt_conn *conn)
