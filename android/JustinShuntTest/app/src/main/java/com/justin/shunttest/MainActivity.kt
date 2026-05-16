@@ -384,7 +384,6 @@ class MainActivity : Activity(), JustinBleCallbacks {
         })
 
         manager.connect(device)
-            .retry(1, 300)
             .timeout(15000)
             .fail { _, status ->
                 if (connectSession == thisConnectSession) {
@@ -659,6 +658,7 @@ private class JustinBleManager(
     private var ledCharacteristic: BluetoothGattCharacteristic? = null
     private var statusCharacteristic: BluetoothGattCharacteristic? = null
     private var secureInfoCharacteristic: BluetoothGattCharacteristic? = null
+    private var secureReadStarted = false
 
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
         val service = gatt.getService(JUSTIN_SERVICE_UUID) ?: return false
@@ -666,6 +666,7 @@ private class JustinBleManager(
         ledCharacteristic = service.getCharacteristic(LED_CONTROL_UUID)
         statusCharacteristic = service.getCharacteristic(STATUS_UUID)
         secureInfoCharacteristic = service.getCharacteristic(SECURE_INFO_UUID)
+        secureReadStarted = false
         return liveCharacteristic != null && ledCharacteristic != null &&
             statusCharacteristic != null && secureInfoCharacteristic != null
     }
@@ -700,6 +701,7 @@ private class JustinBleManager(
         ledCharacteristic = null
         statusCharacteristic = null
         secureInfoCharacteristic = null
+        secureReadStarted = false
     }
 
     fun readLiveData() {
@@ -717,6 +719,12 @@ private class JustinBleManager(
     }
 
     private fun readSecureInfoOnce() {
+        if (secureReadStarted) {
+            appCallbacks.onBleLog(callbackToken, "Secure read already started")
+            return
+        }
+        secureReadStarted = true
+
         readCharacteristic(secureInfoCharacteristic)
             .before { appCallbacks.onGattInit(callbackToken) }
             .with { _, data ->

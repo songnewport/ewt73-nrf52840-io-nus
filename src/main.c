@@ -115,6 +115,7 @@ static void pair_mode_timeout_handler(struct k_work *work);
 static void pair_mode_blink_handler(struct k_work *work);
 static void bond_refresh_work_handler(struct k_work *work);
 static void advertising_start(void);
+static void update_jss_status(void);
 
 /* ---------- LED helpers ---------- */
 
@@ -127,6 +128,7 @@ static void app_led_set(bool on)
 {
 	atomic_set(&app_led_on, on ? 1 : 0);
 	led_set(&activity_led, on ? 1 : 0);
+	update_jss_status();
 }
 
 static void activity_led_off(struct k_work *work)
@@ -140,12 +142,7 @@ static void activity_led_off(struct k_work *work)
 
 static void activity_pulse(void)
 {
-	if (atomic_get(&app_led_on)) {
-		return;
-	}
-
-	led_set(&activity_led, 1);
-	(void)k_work_reschedule(&activity_led_off_work, K_MSEC(80));
+	/* P19 is the app-controlled LED. Do not use it as a traffic indicator. */
 }
 
 /* ---------- NUS debug output ---------- */
@@ -524,8 +521,6 @@ static uint32_t refresh_bonded_count(void)
 	return count;
 }
 
-static void update_jss_status(void);
-
 static void bond_refresh_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -590,11 +585,6 @@ static struct bt_conn *first_live_subscribed_conn(void)
 static bool any_live_subscribed_conn(void)
 {
 	return first_live_subscribed_conn() != NULL;
-}
-
-static bool any_bond_exists(void)
-{
-	return refresh_bonded_count() > 0;
 }
 
 static void remove_conn(struct bt_conn *conn)
@@ -682,25 +672,12 @@ static void pair_mode_timeout_handler(struct k_work *work)
 
 static void enter_pair_mode(void)
 {
-	int sec_err;
-
 	bt_set_bondable(true);
 	atomic_set(&pair_mode_active, 1);
 	(void)k_work_reschedule(&pair_mode_timeout_work, K_SECONDS(PAIR_MODE_WINDOW_SECONDS));
 	(void)k_work_reschedule(&pair_mode_blink_work, K_NO_WAIT);
 	update_jss_status();
 	nus_send_text("SECURITY,PAIR_MODE_ON,timeout=60\r\n");
-
-	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
-		if (!active_conns[i]) {
-			continue;
-		}
-
-		sec_err = bt_conn_set_security(active_conns[i], BT_SECURITY_L2);
-		if (sec_err) {
-			LOG_WRN("Pair-mode security request failed: %d", sec_err);
-		}
-	}
 }
 
 static void clear_all_bonds(void)
@@ -769,7 +746,6 @@ static void advertising_start(void)
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
-	int sec_err;
 
 	if (err) {
 		LOG_ERR("Connection failed, err 0x%02x %s", err, bt_hci_err_to_str(err));
@@ -786,15 +762,6 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	led_set(&conn_led, 1);
 	LOG_INF("Connected: %s", addr);
-
-	if (any_bond_exists() || atomic_get(&pair_mode_active)) {
-		sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
-		if (sec_err) {
-			LOG_WRN("Security request failed: %d", sec_err);
-		} else {
-			LOG_INF("Security requested");
-		}
-	}
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
