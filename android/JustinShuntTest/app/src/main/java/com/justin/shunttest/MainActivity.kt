@@ -64,6 +64,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
     private var isScanning = false
     private var scanSession = 0
     private var connectSession = 0
+    private var lastStatusFields: Map<String, String> = emptyMap()
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
 
@@ -368,6 +369,17 @@ class MainActivity : Activity(), JustinBleCallbacks {
 
     private fun toggleLed() {
         val manager = bleManager ?: return
+        val bondedCount = lastStatusFields["BONDED_COUNT"]?.toIntOrNull() ?: 0
+        val isBonded = lastStatusFields["IS_BONDED"]?.toIntOrNull() ?: 0
+        val pairMode = lastStatusFields["PAIR_MODE"]?.toIntOrNull() ?: 0
+
+        if (bondedCount == 0 && isBonded == 0 && pairMode == 0) {
+            addLog("Device is not bondable now. Hold PAIR 5s, wait PAIR_MODE=1, then press LED.")
+            connectionView.text = "Hold PAIR 5s first. Wait PAIR_MODE=1, then press LED."
+            manager.readStatus()
+            return
+        }
+
         val next = !ledOn
         addLog("LED secure write requested: ${if (next) "01" else "00"}")
         manager.writeLedSecure(next)
@@ -413,6 +425,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
 
     private fun showStatus(text: String) {
         val fields = parseFields(text)
+        lastStatusFields = fields
         val ledValue = fields["LED"]
         if (ledValue == "0" || ledValue == "1") {
             ledOn = ledValue == "1"
