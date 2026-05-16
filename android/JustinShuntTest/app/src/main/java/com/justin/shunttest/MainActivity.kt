@@ -77,6 +77,7 @@ class MainActivity : Activity() {
     private var liveReadFallbackActive = false
     private var readInProgress = false
     private var descriptorWriteInProgress = false
+    private var bondInProgress = false
 
     private val foundDevices = linkedMapOf<String, ScanResult>()
     private val notifyQueue = ArrayDeque<BluetoothGattCharacteristic>()
@@ -149,11 +150,13 @@ class MainActivity : Activity() {
 
             when (device.bondState) {
                 BluetoothDevice.BOND_BONDING -> {
+                    bondInProgress = true
                     setState(AppState.BONDING)
                     addLog("Pairing requested by Android")
                 }
 
                 BluetoothDevice.BOND_BONDED -> {
+                    bondInProgress = false
                     rememberDevice(device)
                     setState(AppState.CONNECTING)
                     addLog("Bonded: ${device.address}")
@@ -161,6 +164,7 @@ class MainActivity : Activity() {
                 }
 
                 BluetoothDevice.BOND_NONE -> {
+                    bondInProgress = false
                     showError("Pairing failed or cancelled. Hold PAIR 5s and try again.")
                 }
             }
@@ -535,10 +539,14 @@ class MainActivity : Activity() {
         if (device.bondState == BluetoothDevice.BOND_BONDED) {
             rememberDevice(device)
             connectGattDelayed(device, 500)
+        } else if (device.bondState == BluetoothDevice.BOND_BONDING || bondInProgress) {
+            addLog("Pairing already in progress")
         } else {
             setState(AppState.BONDING)
             addLog("createBond()")
+            bondInProgress = true
             if (!device.createBond()) {
+                bondInProgress = false
                 showError("createBond() returned false")
             }
         }
@@ -783,6 +791,7 @@ class MainActivity : Activity() {
         descriptorWriteInProgress = false
         liveReadFallbackActive = false
         liveNotifyCount = 0
+        bondInProgress = false
         readInProgress = false
         gatt?.close()
         gatt = null

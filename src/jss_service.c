@@ -12,7 +12,7 @@
 
 LOG_MODULE_REGISTER(jss_service, LOG_LEVEL_INF);
 
-#define JSS_TEXT_MAX_LEN 96
+#define JSS_TEXT_MAX_LEN 160
 
 static const struct bt_uuid_128 jss_service_uuid =
 	BT_UUID_INIT_128(JSS_SERVICE_UUID_VAL);
@@ -36,6 +36,7 @@ static const struct bt_gatt_attr *live_data_attr;
 static const struct bt_gatt_attr *device_status_attr;
 static uint32_t live_notify_attempts;
 static uint32_t live_notify_successes;
+static uint32_t live_notify_skips;
 static int live_notify_last_err;
 
 static ssize_t read_text(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -96,6 +97,9 @@ static void live_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 
 	live_notify_enabled = value == BT_GATT_CCC_NOTIFY;
 	LOG_INF("Live data notify %s", live_notify_enabled ? "enabled" : "disabled");
+	if (service_handlers.live_notify_state) {
+		service_handlers.live_notify_state(live_notify_enabled);
+	}
 }
 
 static void status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
@@ -152,26 +156,42 @@ void jss_service_set_status(const char *text)
 	(void)snprintk(device_status, sizeof(device_status), "%s", text);
 }
 
-void jss_service_notify_live_data(void)
+static void live_notify_complete(struct bt_conn *conn, void *user_data)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(user_data);
+
+	live_notify_successes++;
+	if (service_handlers.live_notify_sent) {
+		service_handlers.live_notify_sent();
+	}
+}
+
+int jss_service_notify_live_data(void)
 {
 	int err;
+	struct bt_gatt_notify_params params;
 
 	if (!live_notify_enabled) {
-		live_notify_last_err = -EACCES;
-		return;
+		live_notify_skips++;
+		return -EACCES;
 	}
 
 	if (!live_data_attr) {
 		live_notify_last_err = -ENOENT;
-		return;
+		return -ENOENT;
 	}
 
+	memset(&params, 0, sizeof(params));
+	params.attr = live_data_attr;
+	params.data = live_data;
+	params.len = strlen(live_data);
+	params.func = live_notify_complete;
+
 	live_notify_attempts++;
-	err = bt_gatt_notify(NULL, live_data_attr, live_data, strlen(live_data));
+	err = bt_gatt_notify_cb(NULL, &params);
 	live_notify_last_err = err;
-	if (!err) {
-		live_notify_successes++;
-	}
+	return err;
 }
 
 void jss_service_notify_status(void)
@@ -210,4 +230,9 @@ uint32_t jss_service_live_notify_successes(void)
 int jss_service_live_notify_last_err(void)
 {
 	return live_notify_last_err;
+}
+
+uint32_t jss_service_live_notify_skips(void)
+{
+	return live_notify_skips;
 }

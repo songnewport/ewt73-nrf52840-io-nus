@@ -36,6 +36,8 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define STATUS_REPORT_INTERVAL_SECONDS 3
 #define PAIR_MODE_WINDOW_SECONDS 60
 #define MAX_CONN CONFIG_BT_MAX_CONN
+#define LIVE_NOTIFICATION_RETRY_MS 200
+#define LIVE_NOTIFICATION_PIPELINE_SIZE CONFIG_BT_CONN_TX_MAX
 
 #define ADC_AIN1_CHANNEL 0
 #define ADC_AIN4_CHANNEL 1
@@ -75,12 +77,14 @@ static struct bt_conn *active_conns[MAX_CONN];
 static struct k_work_delayable activity_led_off_work;
 static struct k_work_delayable pair_mode_timeout_work;
 static struct k_work_delayable pair_mode_blink_work;
+static struct k_work_delayable live_notify_work;
 static struct k_work adv_work;
 static atomic_t pair_short_press_count;
 static atomic_t pair_mode_request_count;
 static atomic_t clear_bonds_request_count;
 static atomic_t bonded_count;
 static atomic_t app_led_on;
+static atomic_t live_notify_pipeline = ATOMIC_INIT(LIVE_NOTIFICATION_PIPELINE_SIZE);
 static int cached_adc_init_err = -ENODEV;
 static int cached_button_init_err = -ENODEV;
 static int cached_ina228_init_err = -ENODEV;
@@ -102,6 +106,7 @@ static const struct bt_data sd[] = {
 
 static void pair_mode_timeout_handler(struct k_work *work);
 static void pair_mode_blink_handler(struct k_work *work);
+static void live_notify_work_handler(struct k_work *work);
 static void advertising_start(void);
 
 static void led_set(const struct gpio_dt_spec *led, int value)
@@ -203,6 +208,7 @@ static int leds_init(void)
 	k_work_init_delayable(&activity_led_off_work, activity_led_off);
 	k_work_init_delayable(&pair_mode_timeout_work, pair_mode_timeout_handler);
 	k_work_init_delayable(&pair_mode_blink_work, pair_mode_blink_handler);
+	k_work_init_delayable(&live_notify_work, live_notify_work_handler);
 	atomic_set(&leds_ready, 1);
 	k_sem_give(&start_ble_sem);
 
@@ -560,16 +566,66 @@ static void update_jss_status(void)
 	char status[160];
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.0,LIVE_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d",
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.1,LIVE_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu",
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
 		       (long)atomic_get(&app_led_on),
 		       jss_service_live_notify_enabled() ? 1 : 0,
 		       (unsigned long)jss_service_live_notify_successes(),
 		       (unsigned long)jss_service_live_notify_attempts(),
-		       jss_service_live_notify_last_err());
+		       jss_service_live_notify_last_err(),
+		       (unsigned long)jss_service_live_notify_skips());
 	jss_service_set_status(status);
-	jss_service_notify_status();
+}
+
+static void schedule_live_notify(k_timeout_t delay)
+{
+	if (!atomic_get(&ble_connected_count) || !jss_service_live_notify_enabled()) {
+		return;
+	}
+
+	(void)k_work_reschedule(&live_notify_work, delay);
+}
+
+static void live_notify_sent(void)
+{
+	atomic_inc(&live_notify_pipeline);
+}
+
+static void live_notify_state_changed(bool enabled)
+{
+	if (enabled) {
+		atomic_set(&live_notify_pipeline, LIVE_NOTIFICATION_PIPELINE_SIZE);
+		schedule_live_notify(K_NO_WAIT);
+	} else {
+		(void)k_work_cancel_delayable(&live_notify_work);
+		atomic_set(&live_notify_pipeline, LIVE_NOTIFICATION_PIPELINE_SIZE);
+	}
+}
+
+static void live_notify_work_handler(struct k_work *work)
+{
+	int err;
+	atomic_val_t pipeline;
+
+	if (!atomic_get(&ble_connected_count) || !jss_service_live_notify_enabled()) {
+		return;
+	}
+
+	pipeline = atomic_get(&live_notify_pipeline);
+	if (pipeline == 0) {
+		(void)k_work_reschedule(k_work_delayable_from_work(work),
+					 K_MSEC(LIVE_NOTIFICATION_RETRY_MS));
+		return;
+	}
+
+	err = jss_service_notify_live_data();
+	if (err == 0) {
+		atomic_dec(&live_notify_pipeline);
+	} else if (err == -ENOMEM || err == -EAGAIN) {
+		(void)k_work_reschedule(k_work_delayable_from_work(work),
+					 K_MSEC(LIVE_NOTIFICATION_RETRY_MS));
+	}
 }
 
 static void pair_mode_blink_handler(struct k_work *work)
@@ -697,6 +753,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	LOG_INF("Disconnected");
 	if (!atomic_get(&ble_connected_count)) {
 		led_set(&conn_led, 0);
+		(void)k_work_cancel_delayable(&live_notify_work);
+		atomic_set(&live_notify_pipeline, LIVE_NOTIFICATION_PIPELINE_SIZE);
 	}
 }
 
@@ -807,6 +865,8 @@ int main(void)
 	static const struct jss_service_handlers jss_handlers = {
 		.led_write = app_led_set,
 		.conn_is_bonded = peer_is_bonded,
+		.live_notify_state = live_notify_state_changed,
+		.live_notify_sent = live_notify_sent,
 	};
 	int err = leds_init();
 	uint32_t seq = 0;
@@ -981,7 +1041,7 @@ int main(void)
 				       (long)(live_temp_x10 / 10),
 				       (long)(live_temp_x10 % 10));
 			jss_service_set_live_data(line);
-			jss_service_notify_live_data();
+			schedule_live_notify(K_NO_WAIT);
 			update_jss_status();
 		}
 
