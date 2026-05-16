@@ -148,6 +148,11 @@ class MainActivity : Activity() {
                 return
             }
 
+            val previousBondState = intent.getIntExtra(
+                BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
+                BluetoothDevice.ERROR
+            )
+
             when (device.bondState) {
                 BluetoothDevice.BOND_BONDING -> {
                     bondInProgress = true
@@ -165,7 +170,11 @@ class MainActivity : Activity() {
 
                 BluetoothDevice.BOND_NONE -> {
                     bondInProgress = false
-                    clearStaleBond(device)
+                    if (previousBondState == BluetoothDevice.BOND_BONDING) {
+                        showError("Pairing failed or cancelled. Hold PAIR 5s and try again.")
+                    } else {
+                        addLog("Bond state is none: ${device.address}")
+                    }
                 }
             }
         }
