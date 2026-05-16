@@ -555,6 +555,11 @@ static bool any_live_subscribed_conn(void)
 	return first_live_subscribed_conn() != NULL;
 }
 
+static bool any_bond_exists(void)
+{
+	return refresh_bonded_count() > 0;
+}
+
 static bool peer_is_bonded(struct bt_conn *conn)
 {
 	/*
@@ -572,7 +577,7 @@ static bool peer_is_bonded(struct bt_conn *conn)
 		return false;
 	}
 
-	return refresh_bonded_count() > 0;
+	return any_bond_exists();
 }
 
 static void remove_conn(struct bt_conn *conn)
@@ -606,7 +611,7 @@ static void update_jss_status(void)
 	struct bt_conn *conn = first_active_conn();
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.4,MTU=%u,SEC_LEVEL=%u,IS_BONDED=%d,LIVE_CCC=%d,LIVE_SUB=%d,STATUS_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu,LAST_WRITE_ERR=%d",
+		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=0.2.5,MTU=%u,SEC_LEVEL=%u,IS_BONDED=%d,LIVE_CCC=%d,LIVE_SUB=%d,STATUS_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu,LAST_WRITE_ERR=%d",
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
 		       (long)atomic_get(&app_led_on),
@@ -783,7 +788,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	led_set(&conn_led, 1);
 	LOG_INF("Connected: %s", addr);
 
-	if (peer_is_bonded(conn) || atomic_get(&pair_mode_active)) {
+	if (any_bond_exists() || atomic_get(&pair_mode_active)) {
 		sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
 		if (sec_err) {
 			LOG_WRN("Security request failed: %d", sec_err);
