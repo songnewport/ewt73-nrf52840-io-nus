@@ -83,6 +83,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
     private lateinit var devicesView: LinearLayout
     private lateinit var logView: TextView
     private lateinit var scanButton: Button
+    private lateinit var disconnectButton: Button
     private lateinit var ledButton: Button
     private lateinit var readStatusButton: Button
     private lateinit var forgetButton: Button
@@ -184,6 +185,11 @@ class MainActivity : Activity(), JustinBleCallbacks {
             text = "Scan / Reconnect"
             setOnClickListener { startScan() }
         }
+        disconnectButton = Button(this).apply {
+            text = "Disconnect"
+            isEnabled = false
+            setOnClickListener { disconnectDevice() }
+        }
         ledButton = Button(this).apply {
             text = "P19 LED ON"
             isEnabled = false
@@ -206,8 +212,9 @@ class MainActivity : Activity(), JustinBleCallbacks {
         root.addView(titleText("Justin Shunt Test", 25f))
         root.addView(stateView)
         root.addView(connectionView)
-        root.addView(buttonRow(scanButton, ledButton))
-        root.addView(buttonRow(readStatusButton, forgetButton))
+        root.addView(buttonRow(scanButton, disconnectButton))
+        root.addView(buttonRow(ledButton, readStatusButton))
+        root.addView(forgetButton)
         root.addView(clearLogButton)
         root.addView(sectionLabel("Live Data"))
         root.addView(liveView)
@@ -539,6 +546,11 @@ class MainActivity : Activity(), JustinBleCallbacks {
                 newState == AppState.CONNECTED
             val connected = newState == AppState.CONNECTED
             scanButton.isEnabled = !busy
+            disconnectButton.isEnabled = bleManager != null &&
+                (newState == AppState.CONNECTING ||
+                    newState == AppState.DISCOVERING ||
+                    newState == AppState.GATT_INIT ||
+                    newState == AppState.CONNECTED)
             ledButton.isEnabled = connected && secureReady && !ledWriteInProgress
             readStatusButton.isEnabled = connected && secureReady
         }
@@ -590,7 +602,16 @@ class MainActivity : Activity(), JustinBleCallbacks {
         mainHandler.post {
             ledButton.isEnabled = false
             readStatusButton.isEnabled = false
+            disconnectButton.isEnabled = false
         }
+    }
+
+    private fun disconnectDevice() {
+        stopScan()
+        closeManager()
+        setState(AppState.DISCONNECTED)
+        connectionView.text = "Disconnected"
+        addLog("Disconnected by user")
     }
 
     private fun isActiveToken(token: Int): Boolean {

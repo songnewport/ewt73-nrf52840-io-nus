@@ -940,6 +940,26 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 	}
 }
 
+static enum bt_security_err pairing_accept(struct bt_conn *conn,
+					   const struct bt_conn_pairing_feat *const feat)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	ARG_UNUSED(feat);
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (!atomic_get(&pair_mode_active)) {
+		LOG_WRN("Reject pairing from %s: pair mode inactive", addr);
+		nus_send_text("SECURITY,PAIRING_REJECTED,pair_mode=0\r\n");
+		return BT_SECURITY_ERR_PAIR_NOT_ALLOWED;
+	}
+
+	LOG_INF("Accept pairing from %s: pair mode active", addr);
+	nus_send_text("SECURITY,PAIRING_ACCEPTED,pair_mode=1\r\n");
+	return BT_SECURITY_ERR_SUCCESS;
+}
+
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -985,6 +1005,10 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 static struct bt_conn_auth_info_cb auth_info_cb = {
 	.pairing_complete = pairing_complete,
 	.pairing_failed = pairing_failed,
+};
+
+static struct bt_conn_auth_cb auth_cb = {
+	.pairing_accept = pairing_accept,
 };
 
 /* ---------- NUS receive ---------- */
@@ -1073,6 +1097,11 @@ int main(void)
 
 	/* adv_work must be initialised before bt_enable: recycled_cb may fire immediately. */
 	k_work_init(&adv_work, adv_work_handler);
+
+	err = bt_conn_auth_cb_register(&auth_cb);
+	if (err) {
+		error_blink_forever(5);
+	}
 
 	err = bt_conn_auth_info_cb_register(&auth_info_cb);
 	if (err) {
