@@ -88,7 +88,12 @@
 	clock-frequency = <I2C_BITRATE_STANDARD>;
 
 	ina228: ina228@40 {
+		compatible = "ti,ina228";
 		reg = <0x40>;
+		status = "okay";
+		current-lsb-microamps = <19>;
+		rshunt-micro-ohms = <15000>;
+		avg-count = <16>;
 	};
 };
 

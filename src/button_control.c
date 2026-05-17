@@ -169,6 +169,8 @@ int button_control_init(button_control_event_handler_t handler, void *user_data)
 		return err;
 	}
 
+	/* SW3/SW4 are status inputs sampled in the main loop. Only PAIR uses
+	 * interrupts because it owns short/long-press timing. */
 	k_work_init_delayable(&debounce_work, debounce_work_handler);
 	k_work_init_delayable(&pair_mode_work, pair_mode_work_handler);
 	k_work_init_delayable(&clear_bonds_work, clear_bonds_work_handler);

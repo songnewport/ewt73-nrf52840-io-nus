@@ -52,6 +52,7 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define INA228_DEFAULT_RATED_MV 150
 #define INA228_DEFAULT_RATED_MA 10000
 #define INA228_DEFAULT_AVG_COUNT 16
+#define USE_ZEPHYR_INA228_SENSOR 1
 
 #define INA228_REG_CONFIG 0x00
 #define INA228_REG_ADC_CONFIG 0x01
@@ -68,7 +69,10 @@ static const struct gpio_dt_spec heartbeat_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0)
 static const struct gpio_dt_spec conn_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static const struct gpio_dt_spec activity_led = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 static const struct device *const nrf_temp = DEVICE_DT_GET_ANY(nordic_nrf_temp);
+static const struct device *const ina228_dev = DEVICE_DT_GET(DT_NODELABEL(ina228));
+#if !USE_ZEPHYR_INA228_SENSOR
 static const struct i2c_dt_spec ina228_i2c = I2C_DT_SPEC_GET(DT_NODELABEL(ina228));
+#endif
 static const struct adc_dt_spec adc_channels[] = {
 	ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), ADC_AIN1_CHANNEL),
 	ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), ADC_AIN4_CHANNEL),
@@ -81,6 +85,7 @@ static atomic_t nrf_temp_ready;
 static atomic_t ble_connected_count;
 static atomic_t pair_mode_active;
 static struct bt_conn *active_conns[MAX_CONN];
+static K_MUTEX_DEFINE(active_conns_mutex);
 static struct k_work_delayable activity_led_off_work;
 static struct k_work_delayable pair_mode_timeout_work;
 static struct k_work_delayable pair_mode_blink_work;
@@ -95,7 +100,9 @@ static int cached_adc_init_err = -ENODEV;
 static int cached_button_init_err = -ENODEV;
 static int cached_ina228_init_err = -ENODEV;
 static int cached_nrf_temp_init_err = -ENODEV;
+#if !USE_ZEPHYR_INA228_SENSOR
 static int64_t ina228_current_lsb_na;
+#endif
 static uint16_t ina228_manufacturer_id;
 static uint16_t ina228_device_id;
 
@@ -155,18 +162,21 @@ static void nus_send_text(const char *text)
 		return;
 	}
 
+	k_mutex_lock(&active_conns_mutex, K_FOREVER);
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
 		if (active_conns[i]) {
-			conn = active_conns[i];
+			conn = bt_conn_ref(active_conns[i]);
 			break;
 		}
 	}
+	k_mutex_unlock(&active_conns_mutex);
 
 	if (!conn) {
 		return;
 	}
 
 	(void)bt_nus_send(conn, text, strlen(text));
+	bt_conn_unref(conn);
 	activity_pulse();
 }
 
@@ -314,10 +324,76 @@ struct ina228_sample {
 	int32_t temp_x10;
 };
 
+#if USE_ZEPHYR_INA228_SENSOR
+static int ina228_inputs_init(uint16_t rated_mv, uint32_t rated_ma, uint16_t avg_count)
+{
+	ARG_UNUSED(rated_mv);
+	ARG_UNUSED(rated_ma);
+	ARG_UNUSED(avg_count);
+
+	if (!device_is_ready(ina228_dev)) {
+		return -ENODEV;
+	}
+
+	ina228_manufacturer_id = 0;
+	ina228_device_id = 0;
+	return 0;
+}
+
+static int ina228_read_all(struct ina228_sample *sample)
+{
+	struct sensor_value value;
+	int64_t micro;
+	int err;
+
+	err = sensor_sample_fetch(ina228_dev);
+	if (err) {
+		return err;
+	}
+
+	err = sensor_channel_get(ina228_dev, SENSOR_CHAN_VOLTAGE, &value);
+	if (err) {
+		return err;
+	}
+	micro = sensor_value_to_micro(&value);
+	sample->bus_mv = (int32_t)(micro / 1000);
+
+	err = sensor_channel_get(ina228_dev, SENSOR_CHAN_VSHUNT, &value);
+	if (err) {
+		return err;
+	}
+	micro = sensor_value_to_micro(&value);
+	sample->shunt_uv = (int32_t)micro;
+
+	err = sensor_channel_get(ina228_dev, SENSOR_CHAN_CURRENT, &value);
+	if (err) {
+		return err;
+	}
+	micro = sensor_value_to_micro(&value);
+	sample->current_ma = (int32_t)(micro / 1000);
+
+	err = sensor_channel_get(ina228_dev, SENSOR_CHAN_POWER, &value);
+	if (err) {
+		return err;
+	}
+	micro = sensor_value_to_micro(&value);
+	sample->power_mw = (int32_t)(micro / 1000);
+
+	err = sensor_channel_get(ina228_dev, SENSOR_CHAN_DIE_TEMP, &value);
+	if (err) {
+		return err;
+	}
+	sample->temp_x10 = value.val1 * 10 + value.val2 / 100000;
+
+	return 0;
+}
+#else
 static int32_t sign_extend_u32(uint32_t value, uint8_t bits)
 {
-	uint32_t sign_bit = BIT(bits - 1);
+	uint32_t sign_bit;
 
+	__ASSERT(bits > 0 && bits <= 32, "bits out of range");
+	sign_bit = BIT(bits - 1);
 	return (int32_t)((value ^ sign_bit) - sign_bit);
 }
 
@@ -499,6 +575,7 @@ static int ina228_read_all(struct ina228_sample *sample)
 
 	return 0;
 }
+#endif
 
 /* ---------- Bond management ---------- */
 
@@ -535,79 +612,132 @@ static void bond_refresh_work_handler(struct k_work *work)
 
 static uint16_t active_uatt_mtu(void)
 {
+	struct bt_conn *conn = NULL;
+	uint16_t mtu;
+
+	k_mutex_lock(&active_conns_mutex, K_FOREVER);
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
 		if (active_conns[i]) {
-			return bt_gatt_get_uatt_mtu(active_conns[i]);
+			conn = bt_conn_ref(active_conns[i]);
+			break;
 		}
 	}
+	k_mutex_unlock(&active_conns_mutex);
 
-	return 0;
+	if (!conn) {
+		return 0;
+	}
+
+	mtu = bt_gatt_get_uatt_mtu(conn);
+	bt_conn_unref(conn);
+	return mtu;
 }
 
 static bt_security_t active_security_level(void)
 {
+	struct bt_conn *conn = NULL;
+	bt_security_t level;
+
+	k_mutex_lock(&active_conns_mutex, K_FOREVER);
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
 		if (active_conns[i]) {
-			return bt_conn_get_security(active_conns[i]);
+			conn = bt_conn_ref(active_conns[i]);
+			break;
 		}
 	}
+	k_mutex_unlock(&active_conns_mutex);
 
-	return BT_SECURITY_L0;
+	if (!conn) {
+		return BT_SECURITY_L0;
+	}
+
+	level = bt_conn_get_security(conn);
+	bt_conn_unref(conn);
+	return level;
 }
 
 static bool active_link_is_bonded(void)
 {
+	struct bt_conn *conn = NULL;
+	bool bonded;
+
 	/* Debug/status helper only. Do not use this to authorize writes;
 	 * BT_GATT_PERM_WRITE_ENCRYPT is the official baseline enforcement. */
+	k_mutex_lock(&active_conns_mutex, K_FOREVER);
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
-		if (active_conns[i] &&
-		    bt_conn_get_security(active_conns[i]) >= BT_SECURITY_L2 &&
-		    atomic_get(&bonded_count) > 0) {
-			return true;
+		if (active_conns[i]) {
+			conn = bt_conn_ref(active_conns[i]);
+			break;
 		}
 	}
+	k_mutex_unlock(&active_conns_mutex);
 
-	return false;
+	if (!conn) {
+		return false;
+	}
+
+	bonded = bt_conn_get_security(conn) >= BT_SECURITY_L2 &&
+		 atomic_get(&bonded_count) > 0;
+	bt_conn_unref(conn);
+	return bonded;
 }
 
-static struct bt_conn *first_live_subscribed_conn(void)
+static struct bt_conn *first_live_subscribed_conn_ref(void)
 {
+	struct bt_conn *conn = NULL;
+
+	k_mutex_lock(&active_conns_mutex, K_FOREVER);
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
 		if (active_conns[i] &&
 		    jss_service_live_is_subscribed(active_conns[i])) {
-			return active_conns[i];
+			conn = bt_conn_ref(active_conns[i]);
+			break;
 		}
 	}
+	k_mutex_unlock(&active_conns_mutex);
 
-	return NULL;
+	return conn;
 }
 
 static bool any_live_subscribed_conn(void)
 {
-	return first_live_subscribed_conn() != NULL;
+	struct bt_conn *conn = first_live_subscribed_conn_ref();
+
+	if (!conn) {
+		return false;
+	}
+
+	bt_conn_unref(conn);
+	return true;
 }
 
 static void remove_conn(struct bt_conn *conn)
 {
+	k_mutex_lock(&active_conns_mutex, K_FOREVER);
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
 		if (active_conns[i] == conn) {
 			bt_conn_unref(active_conns[i]);
 			active_conns[i] = NULL;
 			atomic_dec(&ble_connected_count);
+			k_mutex_unlock(&active_conns_mutex);
 			return;
 		}
 	}
+	k_mutex_unlock(&active_conns_mutex);
 }
 
 static int store_conn(struct bt_conn *conn)
 {
+	k_mutex_lock(&active_conns_mutex, K_FOREVER);
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
 		if (!active_conns[i]) {
 			active_conns[i] = bt_conn_ref(conn);
 			atomic_inc(&ble_connected_count);
+			k_mutex_unlock(&active_conns_mutex);
 			return 0;
 		}
 	}
+	k_mutex_unlock(&active_conns_mutex);
 
 	return -ENOMEM;
 }
@@ -703,9 +833,20 @@ static void clear_all_bonds(void)
 static void reset_bonds_and_enter_pair_mode(void)
 {
 	for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+		struct bt_conn *conn = NULL;
+
+		k_mutex_lock(&active_conns_mutex, K_FOREVER);
 		if (active_conns[i]) {
-			(void)bt_conn_disconnect(active_conns[i], BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+			conn = bt_conn_ref(active_conns[i]);
 		}
+		k_mutex_unlock(&active_conns_mutex);
+
+		if (!conn) {
+			continue;
+		}
+
+		(void)bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(conn);
 	}
 
 	(void)bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
@@ -1083,10 +1224,11 @@ int main(void)
 			jss_service_set_live_data(line);
 
 			{
-				struct bt_conn *live_conn = first_live_subscribed_conn();
+				struct bt_conn *live_conn = first_live_subscribed_conn_ref();
 
 				if (live_conn) {
 					(void)jss_service_notify_live_data(live_conn);
+					bt_conn_unref(live_conn);
 				}
 			}
 

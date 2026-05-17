@@ -237,6 +237,8 @@ void jss_service_set_secure_info(const char *text)
 int jss_service_notify_live_data(struct bt_conn *conn)
 {
 	int err;
+	char notify_data[JSS_TEXT_MAX_LEN];
+	size_t notify_len;
 
 	if (!conn) {
 		live_notify_last_err = -ENOTCONN;
@@ -257,8 +259,11 @@ int jss_service_notify_live_data(struct bt_conn *conn)
 	live_notify_attempts++;
 
 	k_mutex_lock(&live_data_mutex, K_FOREVER);
-	err = bt_gatt_notify(conn, live_data_attr, live_data, strlen(live_data));
+	notify_len = strlen(live_data);
+	memcpy(notify_data, live_data, notify_len);
 	k_mutex_unlock(&live_data_mutex);
+
+	err = bt_gatt_notify(conn, live_data_attr, notify_data, notify_len);
 
 	live_notify_last_err = err;
 	if (err == 0) {
@@ -269,6 +274,9 @@ int jss_service_notify_live_data(struct bt_conn *conn)
 
 void jss_service_notify_status(void)
 {
+	char notify_data[JSS_TEXT_MAX_LEN];
+	size_t notify_len;
+
 	if (!status_notify_enabled) {
 		return;
 	}
@@ -278,8 +286,11 @@ void jss_service_notify_status(void)
 	}
 
 	k_mutex_lock(&status_mutex, K_FOREVER);
-	(void)bt_gatt_notify(NULL, device_status_attr, device_status, strlen(device_status));
+	notify_len = strlen(device_status);
+	memcpy(notify_data, device_status, notify_len);
 	k_mutex_unlock(&status_mutex);
+
+	(void)bt_gatt_notify(NULL, device_status_attr, notify_data, notify_len);
 }
 
 bool jss_service_led_on(void)
