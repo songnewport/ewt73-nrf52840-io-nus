@@ -546,11 +546,7 @@ class MainActivity : Activity(), JustinBleCallbacks {
                 newState == AppState.CONNECTED
             val connected = newState == AppState.CONNECTED
             scanButton.isEnabled = !busy
-            disconnectButton.isEnabled = bleManager != null &&
-                (newState == AppState.CONNECTING ||
-                    newState == AppState.DISCOVERING ||
-                    newState == AppState.GATT_INIT ||
-                    newState == AppState.CONNECTED)
+            disconnectButton.isEnabled = bleManager != null
             ledButton.isEnabled = connected && secureReady && !ledWriteInProgress
             readStatusButton.isEnabled = connected && secureReady
         }
