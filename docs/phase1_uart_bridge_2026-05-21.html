@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phase 1 UART Bridge Status - 2026-05-21</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.55; margin: 32px auto; max-width: 960px; padding: 0 20px; color: #202124; }
+    h1, h2 { line-height: 1.2; }
+    code { background: #f2f4f8; padding: 0.1em 0.35em; border-radius: 4px; }
+    img { max-width: 420px; width: 100%; border: 1px solid #ddd; margin: 12px 20px 20px 0; vertical-align: top; }
+    .note { background: #f8fbff; border-left: 4px solid #2b6cb0; padding: 12px 16px; }
+  </style>
+</head>
+<body>
+  <h1>Phase 1 UART Bridge Status - 2026-05-21</h1>
+  <p class="note">Final verified test used the standalone E73/nRF52840 module. The test board UART low level was observed around 1.x V after connecting STM32, so the remaining test-board issue is treated as hardware/reference-ground related.</p>
+
+  <h2>Current Firmware</h2>
+  <ul>
+    <li>Firmware version: <code>0.3.0-UART-BRIDGE</code></li>
+    <li>BLE device name: <code>Justin_Shunt_Test</code></li>
+    <li>nRF <code>P0.06</code> UART TX to STM32 <code>PA3 / USART2_RX</code></li>
+    <li>nRF <code>P0.08</code> UART RX from STM32 <code>PA2 / USART2_TX</code></li>
+    <li>UART: 9600 8N1, no hardware flow control</li>
+  </ul>
+
+  <h2>BLE Interface</h2>
+  <ul>
+    <li>JSS service: <code>12345678-1234-5678-1234-56789abcdef0</code></li>
+    <li>Live data: <code>...def1</code></li>
+    <li>LED control: <code>...def2</code>, encrypted write</li>
+    <li>Device status: <code>...def3</code></li>
+    <li>Secure info: <code>...def4</code>, encrypted read</li>
+    <li>UART command: <code>...def5</code></li>
+    <li>UART response: <code>...def6</code></li>
+  </ul>
+
+  <h2>UART Diagnostics</h2>
+  <p><code>def3</code> status includes <code>UART_RX</code>, <code>UART_LINES</code>, <code>UART_POS</code>, <code>UART_OVF</code>, <code>UART_TX</code>, <code>UART_CMDS</code>, and <code>UART_LAST</code>.</p>
+
+  <h2>Final Result</h2>
+  <p>The standalone module showed realistic STM32 serial data:</p>
+  <ul>
+    <li><code>UART_RX=11391</code>, <code>UART_LINES=129</code>, <code>UART_POS=87</code></li>
+    <li><code>UART_RX=16908</code>, <code>UART_LINES=193</code>, <code>UART_POS=0</code></li>
+    <li><code>UART_LAST</code> contained STM32 <code>$S,...</code> data with temperature and SOC fields.</li>
+  </ul>
+  <img src="assets/uart-independent-module-165526.png" alt="Standalone module UART diagnostics at 16:55">
+  <img src="assets/uart-independent-module-165658.png" alt="Standalone module UART diagnostics at 16:56">
+
+  <h2>Next Hardware Check</h2>
+  <p>Use nRF ground as the oscilloscope reference and verify the test-board <code>STM32 PA2 -> nRF P0.08</code> low level. The standalone module result confirms the firmware UART direction and receive path are correct.</p>
+</body>
+</html>

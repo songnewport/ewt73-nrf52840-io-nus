@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -27,6 +28,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
@@ -64,6 +66,25 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define INA228_REG_POWER 0x08
 #define INA228_REG_MANUFACTURER_ID 0x3e
 #define INA228_REG_DEVICE_ID 0x3f
+
+/* ---------- STM32 UART telemetry link ---------- */
+#define STM32_UART_NODE DT_NODELABEL(uart0)
+#define STM32_UART_LINE_MAX 300
+
+static const struct device *const stm32_uart_dev = DEVICE_DT_GET(STM32_UART_NODE);
+static char stm32_line_buf[STM32_UART_LINE_MAX];
+static volatile uint16_t stm32_line_pos;
+static K_MUTEX_DEFINE(stm32_telem_mutex);
+/* Latest parsed telemetry string from STM32 — fed to JSS live data */
+static char stm32_live_str[256];
+static volatile bool stm32_telem_valid;
+static atomic_t stm32_uart_rx_bytes;
+static atomic_t stm32_uart_rx_lines;
+static atomic_t stm32_uart_rx_overflows;
+static atomic_t stm32_uart_tx_bytes;
+static atomic_t stm32_uart_cmd_count;
+static K_MUTEX_DEFINE(stm32_uart_diag_mutex);
+static char stm32_uart_last_line[80];
 
 static const struct gpio_dt_spec heartbeat_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec conn_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -577,6 +598,222 @@ static int ina228_read_all(struct ina228_sample *sample)
 }
 #endif
 
+/* ---------- STM32 UART bidirectional bridge ---------- */
+
+/*
+ * STM32 sends two kinds of lines on USART2 TX:
+ *   1. Telemetry: $D,iv:12.8,ii:3.5,...*XX\r\n  (periodic, 1 Hz)
+ *   2. Command replies: OK ...\r\n / ERR ...\r\n / other text
+ *
+ * Telemetry lines start with '$' and are parsed into JSS live data.
+ * Everything else is a command response — forwarded to the App via
+ * the UART Response BLE characteristic (def6) notify.
+ *
+ * App → STM32 direction:
+ *   App writes to UART Command characteristic (def5),
+ *   nRF52840 forwards the text + \r\n to STM32 USART2 RX.
+ */
+
+/* --- TX: send command bytes to STM32 --- */
+
+static void stm32_uart_send(const uint8_t *data, uint16_t len)
+{
+	for (uint16_t i = 0; i < len; i++) {
+		uart_poll_out(stm32_uart_dev, data[i]);
+	}
+	atomic_add(&stm32_uart_tx_bytes, len);
+}
+
+static void stm32_uart_send_str(const char *str)
+{
+	while (*str) {
+		uart_poll_out(stm32_uart_dev, (uint8_t)*str++);
+		atomic_inc(&stm32_uart_tx_bytes);
+	}
+}
+
+/* --- UART command handler: called from JSS def5 write --- */
+
+static void on_uart_cmd_from_app(const uint8_t *data, uint16_t len)
+{
+	atomic_inc(&stm32_uart_cmd_count);
+	/* Forward command text to STM32, append \r\n if not present */
+	stm32_uart_send(data, len);
+	if (len < 2 || data[len - 2] != '\r' || data[len - 1] != '\n') {
+		stm32_uart_send_str("\r\n");
+	}
+	LOG_INF("UART CMD fwd %u bytes to STM32", len);
+}
+
+/* --- RX: telemetry field parser --- */
+
+static bool stm32_parse_field(const char *payload, const char *key,
+			      char *out, size_t out_sz)
+{
+	size_t klen = strlen(key);
+	const char *p = payload;
+
+	while ((p = strstr(p, key)) != NULL) {
+		if (p != payload && *(p - 1) != ',') {
+			p += klen;
+			continue;
+		}
+		p += klen;
+		size_t i = 0;
+		while (*p && *p != ',' && *p != '*' && i < out_sz - 1) {
+			out[i++] = *p++;
+		}
+		out[i] = '\0';
+		return i > 0;
+	}
+	return false;
+}
+
+/* --- RX: process a telemetry packet ($D...*XX) --- */
+
+static void stm32_process_telemetry(const char *line, uint16_t len)
+{
+	const char *star = NULL;
+	for (int i = len - 1; i >= 1; i--) {
+		if (line[i] == '*') { star = &line[i]; break; }
+	}
+	if (!star || (star - line) < 2 || (star + 2) >= (line + len)) {
+		return;
+	}
+
+	uint8_t calc = 0;
+	for (const char *q = line + 1; q < star; q++) {
+		calc ^= (uint8_t)*q;
+	}
+	char hex_str[3] = { star[1], star[2], '\0' };
+	uint8_t expected = (uint8_t)strtoul(hex_str, NULL, 16);
+	if (calc != expected) {
+		LOG_WRN("STM32 checksum fail: 0x%02X vs 0x%02X", calc, expected);
+		return;
+	}
+
+	size_t payload_len = star - (line + 1);
+	char payload[STM32_UART_LINE_MAX];
+	if (payload_len >= sizeof(payload)) { return; }
+	memcpy(payload, line + 1, payload_len);
+	payload[payload_len] = '\0';
+
+	char iv[16]="0", ii[16]="0", it[16]="0", soc[8]="0";
+	char ov[16]="0", oi[16]="0";
+	stm32_parse_field(payload, "iv:", iv, sizeof(iv));
+	stm32_parse_field(payload, "ii:", ii, sizeof(ii));
+	stm32_parse_field(payload, "it:", it, sizeof(it));
+	stm32_parse_field(payload, "soc:", soc, sizeof(soc));
+	stm32_parse_field(payload, "ov:", ov, sizeof(ov));
+	stm32_parse_field(payload, "oi:", oi, sizeof(oi));
+
+	k_mutex_lock(&stm32_telem_mutex, K_FOREVER);
+	(void)snprintk(stm32_live_str, sizeof(stm32_live_str),
+		       "V=%s,I=%s,T=%s,SOC=%s,OV=%s,OI=%s",
+		       iv, ii, it, soc, ov, oi);
+	stm32_telem_valid = true;
+	k_mutex_unlock(&stm32_telem_mutex);
+}
+
+/* --- RX: process a complete line from STM32 --- */
+
+static void stm32_process_line(const char *line, uint16_t len)
+{
+	if (len < 2) { return; }
+
+	atomic_inc(&stm32_uart_rx_lines);
+	k_mutex_lock(&stm32_uart_diag_mutex, K_FOREVER);
+	(void)snprintk(stm32_uart_last_line, sizeof(stm32_uart_last_line), "%s", line);
+	k_mutex_unlock(&stm32_uart_diag_mutex);
+
+	if (line[0] == '$') {
+		/* Telemetry packet → live data */
+		stm32_process_telemetry(line, len);
+	} else {
+		/* Command response → forward to App via BLE notify */
+		jss_service_set_uart_response(line);
+
+		/* Notify all subscribed connections */
+		k_mutex_lock(&active_conns_mutex, K_FOREVER);
+		for (size_t i = 0; i < ARRAY_SIZE(active_conns); i++) {
+			if (active_conns[i] &&
+			    jss_service_uart_rsp_is_subscribed(active_conns[i])) {
+				(void)jss_service_notify_uart_response(
+					active_conns[i]);
+			}
+		}
+		k_mutex_unlock(&active_conns_mutex);
+
+		LOG_DBG("STM32 rsp: %s", line);
+	}
+}
+
+/* --- RX: UART ISR --- */
+
+static void stm32_uart_isr(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (!uart_irq_update(dev)) {
+		return;
+	}
+
+	while (uart_irq_rx_ready(dev)) {
+		uint8_t c;
+		int ret = uart_fifo_read(dev, &c, 1);
+		if (ret <= 0) {
+			break;
+		}
+
+		atomic_inc(&stm32_uart_rx_bytes);
+
+		if (c == '\n') {
+			if (stm32_line_pos > 0) {
+				stm32_line_buf[stm32_line_pos] = '\0';
+				stm32_process_line(stm32_line_buf,
+						   stm32_line_pos);
+				stm32_line_pos = 0;
+			}
+		} else if (c == '\r') {
+			/* skip CR, wait for LF */
+		} else {
+			if (stm32_line_pos < STM32_UART_LINE_MAX - 1) {
+				stm32_line_buf[stm32_line_pos++] = (char)c;
+			} else {
+				stm32_line_pos = 0;
+				atomic_inc(&stm32_uart_rx_overflows);
+			}
+		}
+	}
+}
+
+/* --- Init --- */
+
+static int stm32_uart_init(void)
+{
+	if (!device_is_ready(stm32_uart_dev)) {
+		LOG_ERR("STM32 UART device not ready");
+		return -ENODEV;
+	}
+
+	stm32_line_pos = 0;
+	stm32_telem_valid = false;
+	atomic_set(&stm32_uart_rx_bytes, 0);
+	atomic_set(&stm32_uart_rx_lines, 0);
+	atomic_set(&stm32_uart_rx_overflows, 0);
+	atomic_set(&stm32_uart_tx_bytes, 0);
+	atomic_set(&stm32_uart_cmd_count, 0);
+	k_mutex_lock(&stm32_uart_diag_mutex, K_FOREVER);
+	stm32_uart_last_line[0] = '\0';
+	k_mutex_unlock(&stm32_uart_diag_mutex);
+
+	uart_irq_callback_set(stm32_uart_dev, stm32_uart_isr);
+	uart_irq_rx_enable(stm32_uart_dev);
+
+	LOG_INF("STM32 UART bridge ready (9600 8N1, P0.08 RX, P0.06 TX)");
+	return 0;
+}
+
 /* ---------- Bond management ---------- */
 
 static void count_bond(const struct bt_bond_info *info, void *user_data)
@@ -747,26 +984,27 @@ static int store_conn(struct bt_conn *conn)
 static void update_jss_status(void)
 {
 	char status[256];
+	char uart_last[80];
+
+	k_mutex_lock(&stm32_uart_diag_mutex, K_FOREVER);
+	(void)snprintk(uart_last, sizeof(uart_last), "%s", stm32_uart_last_line);
+	k_mutex_unlock(&stm32_uart_diag_mutex);
 
 	(void)snprintk(status, sizeof(status),
-		       "PAIR_MODE=%d,BONDED_COUNT=%ld,LED=%ld,FW=" JSS_FW_VERSION ","
-		       "MTU=%u,SEC_LEVEL=%u,IS_BONDED=%d,LIVE_CCC=%d,LIVE_SUB=%d,"
-		       "STATUS_CCC=%d,LIVE_NTF=%lu/%lu,LIVE_ERR=%d,LIVE_SKIP=%lu,"
-		       "LAST_WRITE_ERR=%d",
+		       "PAIR_MODE=%d,BONDS=%ld,SEC=%u,IS_BONDED=%d,"
+		       "UART_RX=%ld,UART_LINES=%ld,UART_POS=%u,UART_OVF=%ld,"
+		       "UART_TX=%ld,UART_CMDS=%ld,UART_LAST=%s,FW=" JSS_FW_VERSION,
 		       atomic_get(&pair_mode_active) ? 1 : 0,
 		       (long)atomic_get(&bonded_count),
-		       (long)atomic_get(&app_led_on),
-		       active_uatt_mtu(),
 		       active_security_level(),
 		       active_link_is_bonded() ? 1 : 0,
-		       jss_service_live_notify_enabled() ? 1 : 0,
-		       any_live_subscribed_conn() ? 1 : 0,
-		       jss_service_status_notify_enabled() ? 1 : 0,
-		       (unsigned long)jss_service_live_notify_successes(),
-		       (unsigned long)jss_service_live_notify_attempts(),
-		       jss_service_live_notify_last_err(),
-		       (unsigned long)jss_service_live_notify_skips(),
-		       jss_service_led_write_last_err());
+		       (long)atomic_get(&stm32_uart_rx_bytes),
+		       (long)atomic_get(&stm32_uart_rx_lines),
+		       stm32_line_pos,
+		       (long)atomic_get(&stm32_uart_rx_overflows),
+		       (long)atomic_get(&stm32_uart_tx_bytes),
+		       (long)atomic_get(&stm32_uart_cmd_count),
+		       uart_last);
 	jss_service_set_status(status);
 	/* Notify status to subscribed peers immediately. */
 	jss_service_notify_status();
@@ -1068,6 +1306,7 @@ int main(void)
 {
 	static const struct jss_service_handlers jss_handlers = {
 		.led_write = app_led_set,
+		.uart_cmd = on_uart_cmd_from_app,
 	};
 	int err = leds_init();
 	uint32_t seq = 0;
@@ -1094,6 +1333,9 @@ int main(void)
 	if (!cached_nrf_temp_init_err) {
 		atomic_set(&nrf_temp_ready, 1);
 	}
+
+	/* STM32 telemetry UART link */
+	(void)stm32_uart_init();
 
 	/* adv_work must be initialised before bt_enable: recycled_cb may fire immediately. */
 	k_work_init(&adv_work, adv_work_handler);
@@ -1243,14 +1485,32 @@ int main(void)
 				nus_send_text(line);
 			}
 
-			/* Official baseline: direct notify, no pipeline. */
-			(void)snprintk(line, sizeof(line), "V=%ld.%03ld,I=%ld,T=%ld.%ld,SOC=88",
-				       (long)(live_vbus_mv / 1000),
-				       (long)(live_vbus_mv % 1000),
-				       (long)live_current_ma,
-				       (long)(live_temp_x10 / 10),
-				       (long)(live_temp_x10 % 10));
-			jss_service_set_live_data(line);
+			/* Official baseline: direct notify, no pipeline.
+			 * Prefer STM32 telemetry when available; fall back to local sensors. */
+			{
+				bool have_stm32 = false;
+				char live_line[256];
+
+				k_mutex_lock(&stm32_telem_mutex, K_FOREVER);
+				if (stm32_telem_valid) {
+					memcpy(live_line, stm32_live_str,
+					       sizeof(live_line));
+					have_stm32 = true;
+				}
+				k_mutex_unlock(&stm32_telem_mutex);
+
+				if (!have_stm32) {
+					(void)snprintk(live_line, sizeof(live_line),
+						       "V=%ld.%03ld,I=%ld,T=%ld.%ld,SOC=0",
+						       (long)(live_vbus_mv / 1000),
+						       (long)(live_vbus_mv % 1000),
+						       (long)live_current_ma,
+						       (long)(live_temp_x10 / 10),
+						       (long)(live_temp_x10 % 10));
+				}
+
+				jss_service_set_live_data(live_line);
+			}
 
 			{
 				struct bt_conn *live_conn = first_live_subscribed_conn_ref();
